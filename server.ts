@@ -47,10 +47,77 @@ app.use(express.json());
 // In-memory project state (should be persisted in a real DB)
 let projects: any[] = [];
 
+// Key and Subscription management
+const KEYS_FILE = path.join(process.cwd(), "keys.json");
+const SUBSCRIPTION_FILE = path.join(process.cwd(), "subscription.json");
+
+let keys: { code: string; type: "PRO" | "ULTIMATE_PRO"; used: boolean }[] = [];
+let userSubscription = { type: "LOCKED", limit: 0 };
+
+if (fs.existsSync(KEYS_FILE)) {
+  keys = JSON.parse(fs.readFileSync(KEYS_FILE, "utf-8"));
+}
+if (fs.existsSync(SUBSCRIPTION_FILE)) {
+  userSubscription = JSON.parse(fs.readFileSync(SUBSCRIPTION_FILE, "utf-8"));
+}
+
+const saveKeys = async () => {
+  fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
+  const client = getSupabase();
+  if (client) {
+    // Upsert all keys to Supabase
+    await client.from("keys").upsert(keys);
+  }
+};
+
+const saveSubscription = async () => {
+  fs.writeFileSync(SUBSCRIPTION_FILE, JSON.stringify(userSubscription, null, 2));
+  const client = getSupabase();
+  if (client) {
+    // Save app settings/subscription to Supabase
+    await client.from("settings").upsert([{ id: "subscription", data: userSubscription }]);
+  }
+};
+
+const syncKeysWithSupabase = async () => {
+  const client = getSupabase();
+  if (!client) return;
+  const { data, error } = await client.from("keys").select("*");
+  if (!error && data) {
+    keys = data;
+    fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
+  }
+  const { data: subData, error: subError } = await client.from("settings").select("*").eq("id", "subscription").single();
+  if (!subError && subData) {
+    userSubscription = subData.data;
+    fs.writeFileSync(SUBSCRIPTION_FILE, JSON.stringify(userSubscription, null, 2));
+  }
+};
+
+const getDirSize = (dirPath: string): number => {
+  let size = 0;
+  try {
+    const files = fs.readdirSync(dirPath);
+    for (const file of files) {
+      const filePath = path.join(dirPath, file);
+      const stats = fs.statSync(filePath);
+      if (stats.isDirectory()) {
+        size += getDirSize(filePath);
+      } else {
+        size += stats.size;
+      }
+    }
+  } catch (e) {}
+  return size;
+};
+
 // Track active processes
 const activeProcesses: { [key: string]: ChildProcess } = {};
 
 // Supabase client (lazy initialization)
+// Required tables:
+// 1. "keys" (code: text PRIMARY KEY, type: text, used: boolean)
+// 2. "settings" (id: text PRIMARY KEY, data: jsonb)
 let supabase: any = null;
 const getSupabase = () => {
   if (!supabase) {
@@ -215,12 +282,64 @@ const startProject = async (id: string) => {
 // API Routes
 app.get("/api/projects", async (req, res) => {
   await syncProjects();
+  await syncKeysWithSupabase();
   res.json(projects);
 });
 
+app.get("/api/subscription", async (req, res) => {
+  await syncKeysWithSupabase();
+  res.json(userSubscription);
+});
+
+app.post("/api/subscription/redeem", async (req, res) => {
+  const { code } = req.body;
+  const keyIndex = keys.findIndex(k => k.code === code && !k.used);
+  
+  if (keyIndex === -1) {
+    return res.status(400).json({ error: "Invalid or already used key" });
+  }
+
+  const key = keys[keyIndex];
+  key.used = true;
+  await saveKeys();
+
+  if (key.type === "PRO") {
+    userSubscription = { type: "PRO", limit: 5 };
+  } else if (key.type === "ULTIMATE_PRO") {
+    userSubscription = { type: "ULTIMATE_PRO", limit: 10 };
+  }
+  await saveSubscription();
+
+  res.json({ message: `Successfully upgraded to ${key.type}`, subscription: userSubscription });
+});
+
+app.get("/api/admin/keys", async (req, res) => {
+  await syncKeysWithSupabase();
+  res.json(keys);
+});
+
+app.post("/api/admin/keys/generate", async (req, res) => {
+  const { type } = req.body;
+  if (type !== "PRO" && type !== "ULTIMATE_PRO") {
+    return res.status(400).json({ error: "Invalid key type" });
+  }
+
+  const code = Math.random().toString(36).substring(2, 10).toUpperCase();
+  const newKey = { code, type, used: false };
+  keys.push(newKey);
+  await saveKeys();
+
+  res.json(newKey);
+});
+
+app.get("/api/stats/storage", (req, res) => {
+  const size = getDirSize(PROJECTS_DIR);
+  res.json({ size });
+});
+
 app.post("/api/projects", async (req, res) => {
-  if (projects.length >= 10) {
-    return res.status(400).json({ error: "Storage full! Please delete some other bots to create a new one." });
+  if (projects.length >= userSubscription.limit) {
+    return res.status(400).json({ error: `Storage full! Your current plan (${userSubscription.type}) allows only ${userSubscription.limit} bots. Upgrade to create more.` });
   }
   const id = Math.random().toString(36).substr(2, 9);
   const newProject = {
@@ -532,6 +651,7 @@ io.on("connection", (socket) => {
 async function startServer() {
   // Initial sync and restart running projects
   await syncProjects();
+  await syncKeysWithSupabase();
   for (const p of projects) {
     if (p.status === "running") {
       console.log(`[BOOT] Restarting project: ${p.name}`);
