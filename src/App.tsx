@@ -72,12 +72,14 @@ export default function App() {
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   const [isRedeemModalOpen, setIsRedeemModalOpen] = useState(false);
   const [storageSize, setStorageSize] = useState(0);
+  const [dbStatus, setDbStatus] = useState<{ connected: boolean; url: string; key: string } | null>(null);
   
   const socketRef = useRef<Socket | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     localStorage.setItem("view_mode", viewMode);
+    handleFetchDbStatus();
   }, [viewMode]);
 
   useEffect(() => {
@@ -206,7 +208,7 @@ export default function App() {
     }
   };
 
-  const handleGenerateKey = async (type: "PRO" | "ULTIMATE_PRO") => {
+  const handleGenerateKey = async (type: "PRO" | "ULTIMATE_PRO" | "ADMIN") => {
     try {
       const res = await fetch("/api/admin/keys/generate", {
         method: "POST",
@@ -225,8 +227,19 @@ export default function App() {
     if (adminPassword === "TeleHostAdmin@#$021412#") { 
       setIsAdminAuthenticated(true);
       handleFetchAdminKeys();
+      handleFetchDbStatus();
     } else {
       alert("Invalid admin password");
+    }
+  };
+
+  const handleFetchDbStatus = async () => {
+    try {
+      const res = await fetch("/api/db/status");
+      const data = await res.json();
+      setDbStatus(data);
+    } catch (error) {
+      console.error("Failed to fetch DB status");
     }
   };
 
@@ -409,17 +422,22 @@ export default function App() {
                   )}
                 </button>
 
-                <div className="pt-4 border-t border-zinc-800/50 flex items-center justify-center gap-6">
-                  <div className="text-center">
-                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">PRO</p>
-                    <p className="text-xs text-zinc-400">5 Bots</p>
+                  <div className="pt-4 border-t border-zinc-800/50 flex items-center justify-center gap-6">
+                    <div className="text-center">
+                      <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">PRO</p>
+                      <p className="text-xs text-zinc-400">5 Bots</p>
+                    </div>
+                    <div className="w-px h-6 bg-zinc-800" />
+                    <div className="text-center">
+                      <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">ULTIMATE</p>
+                      <p className="text-xs text-zinc-400">10 Bots</p>
+                    </div>
+                    <div className="w-px h-6 bg-zinc-800" />
+                    <div className="text-center">
+                      <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">ADMIN</p>
+                      <p className="text-xs text-zinc-400">999 Bots</p>
+                    </div>
                   </div>
-                  <div className="w-px h-6 bg-zinc-800" />
-                  <div className="text-center">
-                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">ULTIMATE</p>
-                    <p className="text-xs text-zinc-400">10 Bots</p>
-                  </div>
-                </div>
               </div>
 
               <p className="text-center text-[10px] text-zinc-600 font-medium uppercase tracking-widest">
@@ -529,7 +547,14 @@ export default function App() {
             <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold shrink-0 text-white">GU</div>
             <div className="flex-1 min-w-0">
               <p className="text-xs font-bold truncate">Guests User</p>
-              <p className="text-[10px] text-zinc-500 truncate uppercase tracking-widest font-bold">{subscription.type} PLAN</p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-[10px] text-zinc-500 truncate uppercase tracking-widest font-bold">{subscription.type} PLAN</p>
+                <div className="w-1 h-1 rounded-full bg-zinc-800" />
+                <div className={cn(
+                  "w-1.5 h-1.5 rounded-full",
+                  dbStatus?.connected ? "bg-green-500" : "bg-red-500"
+                )} title={dbStatus?.connected ? "Database Connected" : "Database Disconnected"} />
+              </div>
             </div>
             <button 
               onClick={() => setIsAdminPanelOpen(true)}
@@ -1249,19 +1274,55 @@ export default function App() {
                 </div>
               ) : (
                 <div className="flex flex-col h-[500px]">
+                  <div className="p-4 bg-zinc-900/50 border-b border-zinc-800 flex items-center justify-between px-6">
+                    <div className="flex items-center gap-4">
+                      <div className="flex items-center gap-2">
+                        <div className={cn(
+                          "w-2 h-2 rounded-full",
+                          dbStatus?.connected ? "bg-green-500" : "bg-red-500"
+                        )} />
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-400">
+                          Database: {dbStatus?.connected ? "Connected" : "Disconnected"}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 border-l border-zinc-800 pl-4">
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-600">URL:</span>
+                        <span className={cn(
+                          "text-[10px] font-bold uppercase tracking-widest",
+                          dbStatus?.url === "Configured" ? "text-blue-500" : "text-red-500"
+                        )}>{dbStatus?.url}</span>
+                      </div>
+                      <div className="flex items-center gap-2 border-l border-zinc-800 pl-4">
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-600">Key:</span>
+                        <span className={cn(
+                          "text-[10px] font-bold uppercase tracking-widest",
+                          dbStatus?.key === "Configured" ? "text-blue-500" : "text-red-500"
+                        )}>{dbStatus?.key}</span>
+                      </div>
+                    </div>
+                    <button onClick={() => { handleFetchAdminKeys(); handleFetchDbStatus(); }} className="p-2 text-zinc-500 hover:text-white">
+                      <Activity size={16} />
+                    </button>
+                  </div>
                   <div className="p-6 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/30">
                     <div className="flex gap-2">
                       <button 
                         onClick={() => handleGenerateKey("PRO")}
                         className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-xs font-bold transition-all"
                       >
-                        Generate PRO Key
+                        PRO
                       </button>
                       <button 
                         onClick={() => handleGenerateKey("ULTIMATE_PRO")}
                         className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-xs font-bold transition-all"
                       >
-                        Generate ULTIMATE Key
+                        ULTIMATE
+                      </button>
+                      <button 
+                        onClick={() => handleGenerateKey("ADMIN")}
+                        className="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded-lg text-xs font-bold transition-all"
+                      >
+                        ADMIN
                       </button>
                     </div>
                     <button onClick={handleFetchAdminKeys} className="p-2 text-zinc-500 hover:text-white">
@@ -1275,7 +1336,9 @@ export default function App() {
                           <div className="flex items-center gap-4">
                             <div className={cn(
                               "px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest",
-                              key.type === "PRO" ? "bg-zinc-800 text-zinc-400" : "bg-blue-600/20 text-blue-500"
+                              key.type === "PRO" ? "bg-zinc-800 text-zinc-400" : 
+                              key.type === "ULTIMATE_PRO" ? "bg-blue-600/20 text-blue-500" :
+                              "bg-purple-600/20 text-purple-500"
                             )}>
                               {key.type}
                             </div>
