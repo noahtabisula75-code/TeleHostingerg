@@ -97,9 +97,47 @@ const saveProject = async (project: any) => {
   await client.from("projects").upsert({ id, name, type, mainFile, createdAt, status, env });
 };
 
-const startProject = (id: string) => {
+const saveFileToSupabase = async (projectId: string, fileName: string, content: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from("project_files").upsert({ 
+    project_id: projectId, 
+    file_name: fileName, 
+    content,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'project_id,file_name' });
+};
+
+const hydrateProjectFiles = async (projectId: string) => {
+  const client = getSupabase();
+  if (!client) return;
+
+  const projectDir = path.join(PROJECTS_DIR, projectId);
+  if (!fs.existsSync(projectDir)) {
+    fs.mkdirSync(projectDir, { recursive: true });
+  }
+
+  const { data, error } = await client
+    .from("project_files")
+    .select("file_name, content")
+    .eq("project_id", projectId);
+
+  if (!error && data) {
+    for (const file of data) {
+      const filePath = path.join(projectDir, file.file_name);
+      fs.writeFileSync(filePath, file.content);
+    }
+    return true;
+  }
+  return false;
+};
+
+const startProject = async (id: string) => {
   const project = projects.find((p) => p.id === id);
   if (!project || activeProcesses[id]) return;
+
+  // Hydrate files from Supabase before starting (crucial for Render free tier)
+  await hydrateProjectFiles(id);
 
   const projectDir = path.join(PROJECTS_DIR, id);
   
@@ -149,9 +187,10 @@ const startProject = (id: string) => {
     });
   };
 
-  const command = project.type === "node" ? "node" : "python3";
-  const args = [project.mainFile];
-  startProcess(command, args);
+  const mainFile = project.mainFile || (project.type === "python" ? "main.py" : "index.js");
+  const cmd = project.type === "node" ? "node" : "python3";
+  const args = [mainFile];
+  startProcess(cmd, args);
 };
 
 // API Routes
@@ -184,8 +223,18 @@ app.post("/api/projects", async (req, res) => {
   res.json(newProject);
 });
 
-app.post("/api/upload", upload.array("files"), (req, res) => {
-  res.json({ message: "Files uploaded successfully" });
+app.post("/api/upload", upload.array("files"), async (req, res) => {
+  const { projectId } = req.body;
+  const files = req.files as Express.Multer.File[];
+
+  if (projectId && files) {
+    for (const file of files) {
+      const content = fs.readFileSync(file.path, "utf-8");
+      await saveFileToSupabase(projectId, file.originalname, content);
+    }
+  }
+
+  res.json({ message: "Files uploaded and persisted successfully" });
 });
 
 app.post("/api/projects/:id/start", async (req, res) => {
@@ -196,7 +245,7 @@ app.post("/api/projects/:id/start", async (req, res) => {
   if (activeProcesses[id]) return res.status(400).json({ error: "Project already running" });
 
   try {
-    startProject(id);
+    await startProject(id);
     res.json(project);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -226,10 +275,15 @@ app.post("/api/projects/:id/stop", async (req, res) => {
   }
 });
 
-app.get("/api/projects/:id/files", (req, res) => {
+app.get("/api/projects/:id/files", async (req, res) => {
   const { id } = req.params;
   const projectDir = path.join(PROJECTS_DIR, id);
   
+  // If directory doesn't exist, try to hydrate from Supabase
+  if (!fs.existsSync(projectDir)) {
+    await hydrateProjectFiles(id);
+  }
+
   if (!fs.existsSync(projectDir)) {
     return res.json([]);
   }
@@ -427,12 +481,12 @@ io.on("connection", (socket) => {
 async function startServer() {
   // Initial sync and restart running projects
   await syncProjects();
-  projects.forEach(p => {
+  for (const p of projects) {
     if (p.status === "running") {
       console.log(`[BOOT] Restarting project: ${p.name}`);
-      startProject(p.id);
+      await startProject(p.id);
     }
-  });
+  }
 
   // Metric collection loop
   setInterval(async () => {
