@@ -51,7 +51,7 @@ let projects: any[] = [];
 const KEYS_FILE = path.join(process.cwd(), "keys.json");
 const SUBSCRIPTION_FILE = path.join(process.cwd(), "subscription.json");
 
-let keys: { code: string; type: "PRO" | "ULTIMATE_PRO"; used: boolean }[] = [];
+let keys: { code: string; type: "PRO" | "ULTIMATE_PRO" | "ADMIN"; used: boolean }[] = [];
 let userSubscription = { type: "LOCKED", limit: 0 };
 
 if (fs.existsSync(KEYS_FILE)) {
@@ -81,16 +81,28 @@ const saveSubscription = async () => {
 
 const syncKeysWithSupabase = async () => {
   const client = getSupabase();
-  if (!client) return;
+  if (!client) {
+    console.warn("[SUPABASE] Skipping key sync: Supabase client not initialized.");
+    return;
+  }
+  
+  console.log("[SUPABASE] Syncing keys and subscription...");
   const { data, error } = await client.from("keys").select("*");
-  if (!error && data) {
+  if (error) {
+    console.error("[SUPABASE] Error fetching keys:", error.message);
+  } else if (data) {
     keys = data;
     fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
+    console.log(`[SUPABASE] Synced ${keys.length} keys.`);
   }
+
   const { data: subData, error: subError } = await client.from("settings").select("*").eq("id", "subscription").single();
-  if (!subError && subData) {
+  if (subError) {
+    console.error("[SUPABASE] Error fetching subscription:", subError.message);
+  } else if (subData) {
     userSubscription = subData.data;
     fs.writeFileSync(SUBSCRIPTION_FILE, JSON.stringify(userSubscription, null, 2));
+    console.log(`[SUPABASE] Synced subscription: ${userSubscription.type}`);
   }
 };
 
@@ -125,9 +137,29 @@ const getSupabase = () => {
     const key = process.env.SUPABASE_KEY;
     if (url && key) {
       supabase = createClient(url, key);
+    } else {
+      console.warn("[SUPABASE] Missing SUPABASE_URL or SUPABASE_KEY in environment variables.");
     }
   }
   return supabase;
+};
+
+const testSupabaseConnection = async () => {
+  const client = getSupabase();
+  if (!client) return false;
+  
+  try {
+    const { data, error } = await client.from("settings").select("id").limit(1);
+    if (error) {
+      console.error("[SUPABASE] Connection test failed:", error.message);
+      return false;
+    }
+    console.log("[SUPABASE] Successfully connected to database.");
+    return true;
+  } catch (err) {
+    console.error("[SUPABASE] Unexpected error during connection test:", err);
+    return false;
+  }
 };
 
 // Sync projects with Supabase
@@ -291,8 +323,25 @@ app.get("/api/subscription", async (req, res) => {
   res.json(userSubscription);
 });
 
+app.get("/api/db/status", async (req, res) => {
+  const isConnected = await testSupabaseConnection();
+  res.json({ 
+    connected: isConnected,
+    url: process.env.SUPABASE_URL ? "Configured" : "Missing",
+    key: process.env.SUPABASE_KEY ? "Configured" : "Missing"
+  });
+});
+
 app.post("/api/subscription/redeem", async (req, res) => {
   const { code } = req.body;
+
+  // Master Admin Key Check
+  if (code === "ADMIN-MASTER-ACCESS-2026") {
+    userSubscription = { type: "ADMIN", limit: 999 };
+    await saveSubscription();
+    return res.json({ message: "Master Access Granted", subscription: userSubscription });
+  }
+
   const keyIndex = keys.findIndex(k => k.code === code && !k.used);
   
   if (keyIndex === -1) {
@@ -307,6 +356,8 @@ app.post("/api/subscription/redeem", async (req, res) => {
     userSubscription = { type: "PRO", limit: 5 };
   } else if (key.type === "ULTIMATE_PRO") {
     userSubscription = { type: "ULTIMATE_PRO", limit: 10 };
+  } else if (key.type === "ADMIN") {
+    userSubscription = { type: "ADMIN", limit: 999 };
   }
   await saveSubscription();
 
@@ -320,7 +371,7 @@ app.get("/api/admin/keys", async (req, res) => {
 
 app.post("/api/admin/keys/generate", async (req, res) => {
   const { type } = req.body;
-  if (type !== "PRO" && type !== "ULTIMATE_PRO") {
+  if (type !== "PRO" && type !== "ULTIMATE_PRO" && type !== "ADMIN") {
     return res.status(400).json({ error: "Invalid key type" });
   }
 
@@ -650,6 +701,7 @@ io.on("connection", (socket) => {
 // Vite integration
 async function startServer() {
   // Initial sync and restart running projects
+  await testSupabaseConnection();
   await syncProjects();
   await syncKeysWithSupabase();
   for (const p of projects) {
