@@ -63,6 +63,15 @@ export default function App() {
   });
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [subscription, setSubscription] = useState({ type: "LOCKED", limit: 0 });
+  const [redeemCode, setRedeemCode] = useState("");
+  const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
+  const [adminKeys, setAdminKeys] = useState<{ code: string; type: string; used: boolean }[]>([]);
+  const [isRedeeming, setIsRedeeming] = useState(false);
+  const [adminPassword, setAdminPassword] = useState("");
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
+  const [isRedeemModalOpen, setIsRedeemModalOpen] = useState(false);
+  const [storageSize, setStorageSize] = useState(0);
   
   const socketRef = useRef<Socket | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -85,6 +94,14 @@ export default function App() {
     setProjectFiles(files);
   };
 
+  const formatSize = (bytes: number) => {
+    if (bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  };
+
   useEffect(() => {
     // Fetch initial projects
     fetch("/api/projects")
@@ -99,6 +116,16 @@ export default function App() {
           fetchProjectFiles(initialId);
         }
       });
+
+    // Fetch subscription
+    fetch("/api/subscription")
+      .then(res => res.json())
+      .then(data => setSubscription(data));
+
+    // Fetch storage size
+    fetch("/api/stats/storage")
+      .then(res => res.json())
+      .then(data => setStorageSize(data.size));
 
     // Initialize Socket.io
     socketRef.current = io();
@@ -144,10 +171,69 @@ export default function App() {
     setProjects(prev => prev.map(p => p.id === id ? updated : p));
   };
 
+  const handleRedeemKey = async () => {
+    if (!redeemCode.trim()) return;
+    setIsRedeeming(true);
+    try {
+      const res = await fetch("/api/subscription/redeem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: redeemCode }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSubscription(data.subscription);
+        setRedeemCode("");
+        setIsRedeemModalOpen(false);
+        alert(data.message);
+      } else {
+        alert(data.error);
+      }
+    } catch (error) {
+      alert("Failed to redeem key");
+    } finally {
+      setIsRedeeming(false);
+    }
+  };
+
+  const handleFetchAdminKeys = async () => {
+    try {
+      const res = await fetch("/api/admin/keys");
+      const data = await res.json();
+      setAdminKeys(data);
+    } catch (error) {
+      console.error("Failed to fetch keys");
+    }
+  };
+
+  const handleGenerateKey = async (type: "PRO" | "ULTIMATE_PRO") => {
+    try {
+      const res = await fetch("/api/admin/keys/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type }),
+      });
+      if (res.ok) {
+        handleFetchAdminKeys();
+      }
+    } catch (error) {
+      alert("Failed to generate key");
+    }
+  };
+
+  const handleAdminLogin = () => {
+    if (adminPassword === "TeleHostAdmin@#$021412#") { 
+      setIsAdminAuthenticated(true);
+      handleFetchAdminKeys();
+    } else {
+      alert("Invalid admin password");
+    }
+  };
+
   const handleCreateProject = async () => {
     if (!newProjectName) return;
-    if (projects.length >= 10) {
-      alert("Storage full! Please delete some other bots to create a new one.");
+    if (projects.length >= subscription.limit) {
+      alert(`Storage full! Your current plan (${subscription.type}) allows only ${subscription.limit} bots. Upgrade to create more.`);
       return;
     }
     const res = await fetch("/api/projects", {
@@ -168,6 +254,11 @@ export default function App() {
     setIsNewProjectModalOpen(false);
     setNewProjectName("");
     setViewMode("project");
+
+    // Update storage size
+    fetch("/api/stats/storage")
+      .then(res => res.json())
+      .then(data => setStorageSize(data.size));
   };
 
   const handleInstallDependencies = async (id: string) => {
@@ -190,6 +281,11 @@ export default function App() {
     
     // Refresh file list
     fetchProjectFiles(selectedProjectId);
+
+    // Update storage size
+    fetch("/api/stats/storage")
+      .then(res => res.json())
+      .then(data => setStorageSize(data.size));
     
     // Add a log message locally to show upload started
     setLogs(prev => ({
@@ -246,6 +342,11 @@ export default function App() {
       setSelectedProjectId(projects.length > 1 ? projects.find(p => p.id !== id)?.id || null : null);
       setViewMode("dashboard");
     }
+
+    // Update storage size
+    fetch("/api/stats/storage")
+      .then(res => res.json())
+      .then(data => setStorageSize(data.size));
   };
 
   const runningBots = projects.filter(p => p.status === "running").length;
@@ -254,6 +355,81 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-[#0a0a0a] text-zinc-100 font-sans selection:bg-blue-500/30 overflow-hidden">
+      {/* Key Screen / Lock Screen */}
+      <AnimatePresence>
+        {subscription.type === "LOCKED" && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] bg-[#050505] flex flex-col items-center justify-center p-6"
+          >
+            <div className="absolute inset-0 overflow-hidden pointer-events-none">
+              <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-blue-600/10 blur-[120px] rounded-full" />
+              <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-orange-600/10 blur-[120px] rounded-full" />
+            </div>
+
+            <motion.div 
+              initial={{ scale: 0.9, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              className="w-full max-w-md space-y-8 relative z-10"
+            >
+              <div className="text-center space-y-4">
+                <div className="w-20 h-20 bg-blue-600 rounded-3xl flex items-center justify-center shadow-2xl shadow-blue-900/40 mx-auto mb-6">
+                  <Bot className="text-white" size={40} />
+                </div>
+                <h1 className="text-4xl font-black tracking-tighter uppercase italic">BotHost <span className="text-blue-500">Pro</span></h1>
+                <p className="text-zinc-500 font-medium">Please redeem a license key to access the management console.</p>
+              </div>
+
+              <div className="bg-zinc-900/50 border border-zinc-800 p-8 rounded-3xl space-y-6 backdrop-blur-xl">
+                <div className="space-y-2">
+                  <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 ml-1">License Key</label>
+                  <input 
+                    type="text" 
+                    value={redeemCode}
+                    onChange={(e) => setRedeemCode(e.target.value.toUpperCase())}
+                    placeholder="XXXX-XXXX-XXXX"
+                    className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all font-mono text-center tracking-widest"
+                  />
+                </div>
+
+                <button 
+                  onClick={handleRedeemKey}
+                  disabled={!redeemCode || isRedeeming}
+                  className="w-full py-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-2xl font-bold text-sm transition-all shadow-xl shadow-blue-900/20 flex items-center justify-center gap-3 group"
+                >
+                  {isRedeeming ? (
+                    <Activity className="animate-spin" size={18} />
+                  ) : (
+                    <>
+                      <span>Unlock Console</span>
+                      <ChevronRight size={18} className="group-hover:translate-x-1 transition-transform" />
+                    </>
+                  )}
+                </button>
+
+                <div className="pt-4 border-t border-zinc-800/50 flex items-center justify-center gap-6">
+                  <div className="text-center">
+                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">PRO</p>
+                    <p className="text-xs text-zinc-400">5 Bots</p>
+                  </div>
+                  <div className="w-px h-6 bg-zinc-800" />
+                  <div className="text-center">
+                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">ULTIMATE</p>
+                    <p className="text-xs text-zinc-400">10 Bots</p>
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-center text-[10px] text-zinc-600 font-medium uppercase tracking-widest">
+                Contact support if you don't have a key
+              </p>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Sidebar Overlay */}
       <AnimatePresence>
         {isSidebarOpen && (
@@ -305,6 +481,13 @@ export default function App() {
                 <Activity size={18} />
                 <span className="text-sm font-medium">Dashboard</span>
               </button>
+              <button
+                onClick={() => { setIsRedeemModalOpen(true); setIsSidebarOpen(false); }}
+                className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all group text-zinc-400 hover:bg-zinc-900"
+              >
+                <Star size={18} className="text-yellow-500/50 group-hover:text-yellow-500" />
+                <span className="text-sm font-medium">Redeem Key</span>
+              </button>
             </div>
           </div>
 
@@ -343,12 +526,18 @@ export default function App() {
 
         <div className="p-4 border-t border-zinc-800">
           <div className="flex items-center gap-3 px-3 py-2 rounded-lg bg-zinc-900/50 border border-zinc-800/50">
-            <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold shrink-0 text-white">JL</div>
+            <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold shrink-0 text-white">GU</div>
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-bold truncate">Josh Leetabisula</p>
-              <p className="text-[10px] text-zinc-500 truncate">Pro Plan</p>
+              <p className="text-xs font-bold truncate">Guests User</p>
+              <p className="text-[10px] text-zinc-500 truncate uppercase tracking-widest font-bold">{subscription.type} PLAN</p>
             </div>
-            <LogOut size={14} className="text-zinc-600 hover:text-zinc-400 cursor-pointer shrink-0" />
+            <button 
+              onClick={() => setIsAdminPanelOpen(true)}
+              className="p-1.5 hover:bg-zinc-800 rounded-md text-zinc-600 hover:text-zinc-400 transition-colors"
+              title="Admin Panel"
+            >
+              <Settings size={14} />
+            </button>
           </div>
         </div>
       </motion.aside>
@@ -393,38 +582,38 @@ export default function App() {
 
               <button 
                 onClick={() => {
-                  if (projects.length >= 10) {
-                    alert("Storage full! Please delete some other bots to create a new one.");
+                  if (projects.length >= subscription.limit) {
+                    alert(`Storage full! Your current plan (${subscription.type}) allows only ${subscription.limit} bots. Upgrade to create more.`);
                   } else {
                     setIsNewProjectModalOpen(true);
                   }
                 }}
                 className={cn(
                   "flex items-center gap-2 px-6 py-3 rounded-xl font-bold transition-all shadow-lg active:scale-95",
-                  projects.length >= 10 
+                  projects.length >= subscription.limit 
                     ? "bg-zinc-800 text-zinc-500 cursor-not-allowed border border-zinc-700" 
                     : "bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/20"
                 )}
               >
                 <Plus size={20} />
-                {projects.length >= 10 ? "Storage Full" : "New Bot"}
+                {projects.length >= subscription.limit ? "Storage Full" : "New Bot"}
               </button>
 
               {/* Stats Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className={cn(
                   "bg-zinc-900/50 border p-6 rounded-3xl flex items-center gap-4 transition-all",
-                  projects.length >= 10 ? "border-red-500/50 bg-red-500/5" : "border-zinc-800"
+                  projects.length >= subscription.limit ? "border-red-500/50 bg-red-500/5" : "border-zinc-800"
                 )}>
                   <div className={cn(
                     "w-12 h-12 rounded-2xl flex items-center justify-center",
-                    projects.length >= 10 ? "bg-red-600/20" : "bg-blue-600/20"
+                    projects.length >= subscription.limit ? "bg-red-600/20" : "bg-blue-600/20"
                   )}>
-                    <Bot className={projects.length >= 10 ? "text-red-500" : "text-blue-500"} size={24} />
+                    <Bot className={projects.length >= subscription.limit ? "text-red-500" : "text-blue-500"} size={24} />
                   </div>
                   <div>
-                    <p className={cn("text-2xl font-bold", projects.length >= 10 ? "text-red-500" : "")}>{totalBots} / 10</p>
-                    <p className="text-xs text-zinc-500 font-medium">Bots Used {projects.length >= 10 && "(Full)"}</p>
+                    <p className={cn("text-2xl font-bold", projects.length >= subscription.limit ? "text-red-500" : "")}>{totalBots} / {subscription.limit}</p>
+                    <p className="text-xs text-zinc-500 font-medium">Bots Used {projects.length >= subscription.limit && "(Full)"}</p>
                   </div>
                 </div>
 
@@ -453,7 +642,7 @@ export default function App() {
                     <Database className="text-yellow-500" size={24} />
                   </div>
                   <div>
-                    <p className="text-2xl font-bold font-mono">24.3 KB</p>
+                    <p className="text-2xl font-bold font-mono">{formatSize(storageSize)}</p>
                     <p className="text-xs text-zinc-500 font-medium">of 2.5 GB Storage</p>
                   </div>
                 </div>
@@ -937,6 +1126,188 @@ export default function App() {
                   Save Variables
                 </button>
               </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+      
+      {/* Redeem Key Modal */}
+      <AnimatePresence>
+        {isRedeemModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsRedeemModalOpen(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-[#0d0d0d] border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-6 border-b border-zinc-800">
+                <h3 className="text-xl font-bold tracking-tight">Redeem Key</h3>
+                <p className="text-sm text-zinc-500 mt-1">Enter your license key to upgrade your plan.</p>
+              </div>
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-[11px] font-bold uppercase tracking-widest text-zinc-500 mb-2">License Key</label>
+                  <input 
+                    type="text" 
+                    value={redeemCode}
+                    onChange={(e) => setRedeemCode(e.target.value.toUpperCase())}
+                    placeholder="XXXX-XXXX-XXXX"
+                    className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-yellow-600 transition-colors font-mono"
+                  />
+                </div>
+                <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 space-y-3">
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-400">Available Plans</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg">
+                      <p className="text-xs font-bold text-zinc-300">PRO</p>
+                      <p className="text-[10px] text-zinc-500">5 Bots Limit</p>
+                    </div>
+                    <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg">
+                      <p className="text-xs font-bold text-zinc-300">ULTIMATE</p>
+                      <p className="text-[10px] text-zinc-500">10 Bots Limit</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="p-6 bg-zinc-900/50 border-t border-zinc-800 flex gap-3">
+                <button 
+                  onClick={() => setIsRedeemModalOpen(false)}
+                  className="flex-1 px-4 py-3 bg-zinc-800 hover:bg-zinc-700 rounded-xl font-bold text-sm transition-all"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={handleRedeemKey}
+                  disabled={!redeemCode || isRedeeming}
+                  className="flex-1 px-4 py-3 bg-yellow-600 hover:bg-yellow-500 disabled:opacity-50 rounded-xl font-bold text-sm transition-all shadow-lg shadow-yellow-900/20"
+                >
+                  {isRedeeming ? "Redeeming..." : "Redeem Now"}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Admin Panel Modal */}
+      <AnimatePresence>
+        {isAdminPanelOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsAdminPanelOpen(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-2xl bg-[#0d0d0d] border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+                <div>
+                  <h3 className="text-xl font-bold tracking-tight">Admin Panel</h3>
+                  <p className="text-sm text-zinc-500 mt-1">Generate and manage license keys.</p>
+                </div>
+                <button onClick={() => setIsAdminPanelOpen(false)} className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-500">
+                  <X size={20} />
+                </button>
+              </div>
+
+              {!isAdminAuthenticated ? (
+                <div className="p-12 flex flex-col items-center justify-center space-y-6">
+                  <div className="w-16 h-16 bg-zinc-900 border border-zinc-800 rounded-2xl flex items-center justify-center">
+                    <Settings size={32} className="text-zinc-700" />
+                  </div>
+                  <div className="w-full max-w-xs space-y-4 text-center">
+                    <h4 className="font-bold">Restricted Access</h4>
+                    <input 
+                      type="password" 
+                      value={adminPassword}
+                      onChange={(e) => setAdminPassword(e.target.value)}
+                      placeholder="Admin Password"
+                      className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-blue-600 transition-colors text-center"
+                      onKeyDown={(e) => e.key === 'Enter' && handleAdminLogin()}
+                    />
+                    <button 
+                      onClick={handleAdminLogin}
+                      className="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm transition-all"
+                    >
+                      Login to Admin
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col h-[500px]">
+                  <div className="p-6 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/30">
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => handleGenerateKey("PRO")}
+                        className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-xs font-bold transition-all"
+                      >
+                        Generate PRO Key
+                      </button>
+                      <button 
+                        onClick={() => handleGenerateKey("ULTIMATE_PRO")}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-xs font-bold transition-all"
+                      >
+                        Generate ULTIMATE Key
+                      </button>
+                    </div>
+                    <button onClick={handleFetchAdminKeys} className="p-2 text-zinc-500 hover:text-white">
+                      <Activity size={16} />
+                    </button>
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-6 space-y-3 custom-scrollbar">
+                    {adminKeys.length > 0 ? (
+                      adminKeys.map((key, i) => (
+                        <div key={i} className="flex items-center justify-between p-4 bg-zinc-900/50 border border-zinc-800 rounded-xl">
+                          <div className="flex items-center gap-4">
+                            <div className={cn(
+                              "px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest",
+                              key.type === "PRO" ? "bg-zinc-800 text-zinc-400" : "bg-blue-600/20 text-blue-500"
+                            )}>
+                              {key.type}
+                            </div>
+                            <code className="text-sm font-mono text-zinc-300">{key.code}</code>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            {key.used ? (
+                              <span className="text-[10px] font-bold uppercase tracking-widest text-red-500/50">Used</span>
+                            ) : (
+                              <span className="text-[10px] font-bold uppercase tracking-widest text-green-500">Active</span>
+                            )}
+                            <button 
+                              onClick={() => {
+                                navigator.clipboard.writeText(key.code);
+                                alert("Key copied to clipboard!");
+                              }}
+                              className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-500 hover:text-white transition-all"
+                            >
+                              <Plus size={14} className="rotate-45" />
+                            </button>
+                          </div>
+                        </div>
+                      )).reverse()
+                    ) : (
+                      <div className="h-full flex flex-col items-center justify-center text-zinc-700 gap-3">
+                        <Database size={40} strokeWidth={1} className="opacity-20" />
+                        <p className="text-sm">No keys generated yet.</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </motion.div>
           </div>
         )}
