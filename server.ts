@@ -70,6 +70,20 @@ const syncProjects = async () => {
   
   const { data, error } = await client.from("projects").select("*");
   if (!error && data) {
+    // Remove projects that are no longer in Supabase
+    const supabaseIds = data.map(p => p.id);
+    projects = projects.filter(p => {
+      if (!supabaseIds.includes(p.id)) {
+        // Stop process if it was running
+        if (activeProcesses[p.id]) {
+          activeProcesses[p.id].kill();
+          delete activeProcesses[p.id];
+        }
+        return false;
+      }
+      return true;
+    });
+
     // Merge with in-memory projects
     data.forEach(p => {
       const existing = projects.find(ep => ep.id === p.id);
@@ -77,13 +91,18 @@ const syncProjects = async () => {
         projects.push({ 
           ...p, 
           env: p.env || {},
-          status: "stopped", 
+          status: p.status || "stopped", // Respect status from DB on first load
           metrics: { cpu: 0, memory: 0, uptime: 0, requests: 0 }, 
-          startTime: null 
+          startTime: p.status === "running" ? Date.now() : null 
         });
       } else {
         // Update metadata but keep runtime status
-        Object.assign(existing, { name: p.name, type: p.type, mainFile: p.mainFile, env: p.env || {} });
+        Object.assign(existing, { 
+          name: p.name, 
+          type: p.type, 
+          mainFile: p.mainFile, 
+          env: p.env || {} 
+        });
       }
     });
   }
@@ -200,6 +219,9 @@ app.get("/api/projects", async (req, res) => {
 });
 
 app.post("/api/projects", async (req, res) => {
+  if (projects.length >= 10) {
+    return res.status(400).json({ error: "Storage full! Please delete some other bots to create a new one." });
+  }
   const id = Math.random().toString(36).substr(2, 9);
   const newProject = {
     id,
@@ -307,6 +329,35 @@ app.patch("/api/projects/:id", async (req, res) => {
   
   await saveProject(project);
   res.json(project);
+});
+
+app.delete("/api/projects/:id", async (req, res) => {
+  const { id } = req.params;
+  const projectIndex = projects.findIndex(p => p.id === id);
+  
+  if (projectIndex === -1) return res.status(404).json({ error: "Project not found" });
+
+  // Stop process if running
+  if (activeProcesses[id]) {
+    activeProcesses[id].kill();
+    delete activeProcesses[id];
+  }
+
+  // Delete from Supabase if exists
+  const client = getSupabase();
+  if (client) {
+    await client.from("project_files").delete().eq("project_id", id);
+    await client.from("projects").delete().eq("id", id);
+  }
+
+  // Delete local directory
+  const projectDir = path.join(PROJECTS_DIR, id);
+  if (fs.existsSync(projectDir)) {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+
+  projects.splice(projectIndex, 1);
+  res.json({ message: "Project deleted successfully" });
 });
 
 app.post("/api/projects/:id/install", (req, res) => {
