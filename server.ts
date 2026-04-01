@@ -354,9 +354,9 @@ app.post("/api/projects/:id/install", (req, res) => {
       if (cmd === "python3" && args[0] === "-m") {
         runInstall("python", args);
       } else if (cmd === "python" && args[0] === "-m") {
-        runInstall("pip3", ["install", "-r", "requirements.txt"]);
+        runInstall("pip3", ["install", "--break-system-packages", "-r", "requirements.txt"]);
       } else if (cmd === "pip3") {
-        runInstall("pip", ["install", "-r", "requirements.txt"]);
+        runInstall("pip", ["install", "--break-system-packages", "-r", "requirements.txt"]);
       } else {
         io.to(id).emit("log", {
           projectId: id,
@@ -404,7 +404,7 @@ app.post("/api/projects/:id/install", (req, res) => {
                   message: `[SYSTEM] Pip installed successfully via ensurepip. Retrying installation...`,
                   timestamp: new Date().toISOString(),
                 });
-                runInstall("python3", ["-m", "pip", "install", "-r", "requirements.txt"]);
+                runInstall("python3", ["-m", "pip", "install", "--break-system-packages", "-r", "requirements.txt"]);
               } else {
                 // Try get-pip.py
                 io.to(id).emit("log", {
@@ -426,21 +426,21 @@ app.post("/api/projects/:id/install", (req, res) => {
                           message: `[SYSTEM] Pip installed successfully via get-pip.py. Retrying installation...`,
                           timestamp: new Date().toISOString(),
                         });
-                        runInstall("python3", ["-m", "pip", "install", "--user", "-r", "requirements.txt"]);
+                        runInstall("python3", ["-m", "pip", "install", "--break-system-packages", "--user", "-r", "requirements.txt"]);
                       } else {
-                        runInstall("pip3", ["install", "-r", "requirements.txt"]);
+                        runInstall("pip3", ["install", "--break-system-packages", "-r", "requirements.txt"]);
                       }
                     });
                   });
                 }).on("error", (err) => {
                   fs.unlink(getPipPath, () => {});
-                  runInstall("pip3", ["install", "-r", "requirements.txt"]);
+                  runInstall("pip3", ["install", "--break-system-packages", "-r", "requirements.txt"]);
                 });
               }
             });
             handled = true;
           } else if (cmd === "python" && args[0] === "-m") {
-            runInstall("pip", ["install", "-r", "requirements.txt"]);
+            runInstall("pip", ["install", "--break-system-packages", "-r", "requirements.txt"]);
             handled = true;
           }
         }
@@ -463,7 +463,7 @@ app.post("/api/projects/:id/install", (req, res) => {
   };
 
   const command = project.type === "node" ? "npm" : "python3";
-  const args = project.type === "node" ? ["install"] : ["-m", "pip", "install", "-r", "requirements.txt"];
+  const args = project.type === "node" ? ["install"] : ["-m", "pip", "install", "--break-system-packages", "-r", "requirements.txt"];
 
   runInstall(command, args);
 
