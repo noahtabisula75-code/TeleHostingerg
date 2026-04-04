@@ -10,8 +10,12 @@ import https from "https";
 import pidusage from "pidusage";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
+import cookieParser from "cookie-parser";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
 const app = express();
+app.use(cookieParser());
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -25,6 +29,20 @@ const PROJECTS_DIR = path.join(process.cwd(), "projects");
 if (!fs.existsSync(PROJECTS_DIR)) {
   fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 }
+
+const JWT_SECRET = process.env.JWT_SECRET || "bot-host-secret-key-2026";
+
+// Middleware to verify JWT and attach user to request
+const authenticateToken = (req: any, res: any, next: any) => {
+  const token = req.cookies.token || req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+    if (err) return res.status(403).json({ error: "Forbidden" });
+    req.user = user;
+    next();
+  });
+};
 
 // Multer setup for file uploads
 const storage = multer.diskStorage({
@@ -45,65 +63,39 @@ const upload = multer({ storage });
 app.use(express.json());
 
 // In-memory project state (should be persisted in a real DB)
-let projects: any[] = [];
+// Now keyed by userId to prevent cross-user visibility
+let projectsByUserId: { [userId: string]: any[] } = {};
 
 // Key and Subscription management
-const KEYS_FILE = path.join(process.cwd(), "keys.json");
-const SUBSCRIPTION_FILE = path.join(process.cwd(), "subscription.json");
+let maintenanceMode = false;
+let recentActivity: { id: string; type: string; message: string; timestamp: string }[] = [];
 
-let keys: { code: string; type: "PRO" | "ULTIMATE_PRO" | "ADMIN"; used: boolean }[] = [];
-let userSubscription = { type: "LOCKED", limit: 0 };
-
-if (fs.existsSync(KEYS_FILE)) {
-  keys = JSON.parse(fs.readFileSync(KEYS_FILE, "utf-8"));
-}
-if (fs.existsSync(SUBSCRIPTION_FILE)) {
-  userSubscription = JSON.parse(fs.readFileSync(SUBSCRIPTION_FILE, "utf-8"));
-}
-
-const saveKeys = async () => {
-  fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
-  const client = getSupabase();
-  if (client) {
-    // Upsert all keys to Supabase
-    await client.from("keys").upsert(keys);
-  }
+const addActivity = (type: string, message: string) => {
+  recentActivity.unshift({
+    id: Math.random().toString(36).substr(2, 9),
+    type,
+    message,
+    timestamp: new Date().toISOString()
+  });
+  if (recentActivity.length > 50) recentActivity.pop();
+  io.emit("activity", recentActivity[0]);
 };
 
-const saveSubscription = async () => {
-  fs.writeFileSync(SUBSCRIPTION_FILE, JSON.stringify(userSubscription, null, 2));
+const getUserSubscription = async (userId: string) => {
   const client = getSupabase();
-  if (client) {
-    // Save app settings/subscription to Supabase
-    await client.from("settings").upsert([{ id: "subscription", data: userSubscription }]);
-  }
-};
-
-const syncKeysWithSupabase = async () => {
-  const client = getSupabase();
-  if (!client) {
-    console.warn("[SUPABASE] Skipping key sync: Supabase client not initialized.");
-    return;
-  }
+  if (!client) return { type: "Free", limit: 0, duration: "None" };
   
-  console.log("[SUPABASE] Syncing keys and subscription...");
-  const { data, error } = await client.from("keys").select("*");
-  if (error) {
-    console.error("[SUPABASE] Error fetching keys:", error.message);
-  } else if (data) {
-    keys = data;
-    fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
-    console.log(`[SUPABASE] Synced ${keys.length} keys.`);
-  }
+  // Use select("*") to avoid errors if subscription_plan column is missing yet
+  const { data, error } = await client.from("users").select("*").eq("id", userId).single();
+  if (error || !data) return { type: "Free", limit: 0, duration: "None" };
 
-  const { data: subData, error: subError } = await client.from("settings").select("*").eq("id", "subscription").single();
-  if (subError) {
-    console.error("[SUPABASE] Error fetching subscription:", subError.message);
-  } else if (subData) {
-    userSubscription = subData.data;
-    fs.writeFileSync(SUBSCRIPTION_FILE, JSON.stringify(userSubscription, null, 2));
-    console.log(`[SUPABASE] Synced subscription: ${userSubscription.type}`);
-  }
+  const plan = data.subscription_plan || "Free";
+  if (plan === "Lifetime") return { type: "Lifetime", limit: 1000, duration: "Lifetime" };
+  if (plan === "Enterprise") return { type: "Enterprise", limit: 100, duration: "Monthly" };
+  if (plan === "Pro") return { type: "Pro", limit: 10, duration: "Monthly" };
+  
+  // Default to Free
+  return { type: "Free", limit: (plan === "Free" ? 0 : 0), duration: "None" };
 };
 
 const getDirSize = (dirPath: string): number => {
@@ -128,8 +120,9 @@ const activeProcesses: { [key: string]: ChildProcess } = {};
 
 // Supabase client (lazy initialization)
 // Required tables:
-// 1. "keys" (code: text PRIMARY KEY, type: text, used: boolean)
-// 2. "settings" (id: text PRIMARY KEY, data: jsonb)
+// 1. "settings" (id: text PRIMARY KEY, data: jsonb)
+// 2. "users" (id: uuid PRIMARY KEY, username: text UNIQUE, password: text)
+// 3. "projects" (id: text PRIMARY KEY, user_id: uuid, data: jsonb)
 let supabase: any = null;
 const getSupabase = () => {
   if (!supabase) {
@@ -162,16 +155,23 @@ const testSupabaseConnection = async () => {
   }
 };
 
-// Sync projects with Supabase
-const syncProjects = async () => {
+// Sync projects with Supabase for a specific user
+const syncProjects = async (userId: string) => {
   const client = getSupabase();
   if (!client) return;
   
-  const { data, error } = await client.from("projects").select("*");
-  if (!error && data) {
+  const { data, error } = await client.from("projects").select("*").eq("user_id", userId);
+  if (error) {
+    console.error("[SUPABASE] Error syncing projects:", error.message);
+    return;
+  }
+
+  if (data) {
+    if (!projectsByUserId[userId]) projectsByUserId[userId] = [];
+    
     // Remove projects that are no longer in Supabase
     const supabaseIds = data.map(p => p.id);
-    projects = projects.filter(p => {
+    projectsByUserId[userId] = projectsByUserId[userId].filter(p => {
       if (!supabaseIds.includes(p.id)) {
         // Stop process if it was running
         if (activeProcesses[p.id]) {
@@ -185,34 +185,49 @@ const syncProjects = async () => {
 
     // Merge with in-memory projects
     data.forEach(p => {
-      const existing = projects.find(ep => ep.id === p.id);
+      const projectData = p.data || {};
+      const existing = projectsByUserId[userId].find(ep => ep.id === p.id);
       if (!existing) {
-        projects.push({ 
-          ...p, 
-          env: p.env || {},
-          status: p.status || "stopped", // Respect status from DB on first load
+        projectsByUserId[userId].push({ 
+          id: p.id,
+          name: p.name || projectData.name || "Untitled Project",
+          type: p.type || projectData.type || "node",
+          mainFile: p.main_file || projectData.mainFile || (projectData.type === "python" ? "main.py" : "index.js"),
+          createdAt: projectData.createdAt || new Date().toISOString(),
+          env: projectData.env || {},
+          status: p.status || projectData.status || "stopped",
           metrics: { cpu: 0, memory: 0, uptime: 0, requests: 0 }, 
-          startTime: p.status === "running" ? Date.now() : null 
+          startTime: (p.status === "running" || projectData.status === "running") ? Date.now() : null 
         });
       } else {
         // Update metadata but keep runtime status
         Object.assign(existing, { 
-          name: p.name, 
-          type: p.type, 
-          mainFile: p.mainFile, 
-          env: p.env || {} 
+          name: p.name || projectData.name || existing.name, 
+          type: p.type || projectData.type || existing.type, 
+          mainFile: p.main_file || projectData.mainFile || existing.mainFile, 
+          env: projectData.env || existing.env,
+          status: existing.status || p.status || projectData.status || "stopped"
         });
       }
     });
   }
 };
 
-const saveProject = async (project: any) => {
+const saveProject = async (project: any, userId: string) => {
   const client = getSupabase();
   if (!client) return;
   
-  const { id, name, type, mainFile, createdAt, status, env } = project;
-  await client.from("projects").upsert({ id, name, type, mainFile, createdAt, status, env });
+  const { id, metrics, startTime, status, name, type, mainFile, ...rest } = project;
+  const { error } = await client.from("projects").upsert({ 
+    id, 
+    user_id: userId,
+    name: name || project.name || "Untitled Project",
+    status: status || "stopped",
+    type: type || project.type || "node",
+    main_file: mainFile || project.mainFile || (project.type === "python" ? "main.py" : "index.js"),
+    data: { ...rest, status: status || "stopped", name: name || project.name, type: type || project.type, mainFile: mainFile || project.mainFile } 
+  });
+  if (error) console.error("[SUPABASE] Error saving project:", error.message);
 };
 
 const saveFileToSupabase = async (projectId: string, fileName: string, content: string) => {
@@ -250,8 +265,9 @@ const hydrateProjectFiles = async (projectId: string) => {
   return false;
 };
 
-const startProject = async (id: string) => {
-  const project = projects.find((p) => p.id === id);
+const startProject = async (id: string, userId: string) => {
+  if (!projectsByUserId[userId]) return;
+  const project = projectsByUserId[userId].find((p) => p.id === id);
   if (!project || activeProcesses[id]) return;
 
   // Hydrate files from Supabase before starting (crucial for Render free tier)
@@ -275,7 +291,7 @@ const startProject = async (id: string) => {
           timestamp: new Date().toISOString(),
         });
         project.status = "stopped";
-        saveProject(project);
+        saveProject(project, userId);
         delete activeProcesses[id];
         io.to(id).emit("status_change", { projectId: id, status: "stopped" });
       }
@@ -284,7 +300,7 @@ const startProject = async (id: string) => {
     activeProcesses[id] = child;
     project.status = "running";
     project.startTime = Date.now();
-    saveProject(project);
+    saveProject(project, userId);
     io.to(id).emit("status_change", { projectId: id, status: "running" });
 
     child.stdout?.on("data", (data) => {
@@ -299,7 +315,7 @@ const startProject = async (id: string) => {
       project.status = "stopped";
       project.startTime = null;
       project.metrics = { cpu: 0, memory: 0, uptime: 0, requests: 0 };
-      saveProject(project);
+      saveProject(project, userId);
       delete activeProcesses[id];
       io.to(id).emit("status_change", { projectId: id, status: "stopped" });
     });
@@ -312,15 +328,208 @@ const startProject = async (id: string) => {
 };
 
 // API Routes
-app.get("/api/projects", async (req, res) => {
-  await syncProjects();
-  await syncKeysWithSupabase();
-  res.json(projects);
+app.post("/api/auth/register", async (req, res) => {
+  const { username, password } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data: existing } = await client.from("users").select("*").eq("username", username).single();
+  if (existing) return res.status(400).json({ error: "Username already exists" });
+
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const { data, error } = await client.from("users").insert([{ 
+    username, 
+    password: hashedPassword,
+    subscription_plan: req.body.subscriptionPlan || "Free",
+    created_at: new Date().toISOString()
+  }]).select().single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const token = jwt.sign({ id: data.id, username: data.username }, JWT_SECRET);
+  res.cookie("token", token, { 
+    httpOnly: true, 
+    sameSite: "none", 
+    secure: true,
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+  });
+  res.json({ token, user: { id: data.id, username: data.username } });
 });
 
-app.get("/api/subscription", async (req, res) => {
-  await syncKeysWithSupabase();
-  res.json(userSubscription);
+app.post("/api/auth/login", async (req, res) => {
+  const { username, password } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data, error } = await client.from("users").select("*").eq("username", username).single();
+  if (error || !data) return res.status(400).json({ error: "User not found" });
+
+  const valid = await bcrypt.compare(password, data.password);
+  if (!valid) return res.status(400).json({ error: "Invalid password" });
+
+  const token = jwt.sign({ id: data.id, username: data.username }, JWT_SECRET);
+  res.cookie("token", token, { 
+    httpOnly: true, 
+    sameSite: "none", 
+    secure: true,
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+  });
+  res.json({ token, user: { id: data.id, username: data.username } });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  res.clearCookie("token");
+  res.json({ message: "Logged out" });
+});
+
+app.get("/api/auth/me", authenticateToken, async (req: any, res) => {
+  const client = getSupabase();
+  if (!client) return res.json(req.user);
+  
+  const { data } = await client.from("users").select("id, username, subscription_plan, created_at, bio, avatar_url").eq("id", req.user.id).single();
+  res.json(data || req.user);
+});
+
+app.patch("/api/users/profile", authenticateToken, async (req: any, res) => {
+  const { username, bio, avatar_url } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data, error } = await client.from("users")
+    .update({ username, bio, avatar_url })
+    .eq("id", req.user.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post("/api/users/change-password", authenticateToken, async (req: any, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  // Get current user with password
+  const { data: user, error: fetchError } = await client.from("users").select("password").eq("id", req.user.id).single();
+  if (fetchError || !user) return res.status(404).json({ error: "User not found" });
+
+  // Verify current password
+  const valid = await bcrypt.compare(currentPassword, user.password);
+  if (!valid) return res.status(400).json({ error: "Incorrect current password" });
+
+  // Hash new password
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+  const { error: updateError } = await client.from("users")
+    .update({ password: hashedPassword })
+    .eq("id", req.user.id);
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+  res.json({ message: "Password changed successfully" });
+});
+
+// User Search & Profiles
+app.get("/api/users/search", authenticateToken, async (req, res) => {
+  const { q } = req.query;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data, error } = await client.from("users")
+    .select("id, username, subscription_plan, created_at")
+    .ilike("username", `%${q}%`)
+    .limit(20);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get("/api/users/:id", authenticateToken, async (req, res) => {
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data, error } = await client.from("users")
+    .select("id, username, subscription_plan, created_at")
+    .eq("id", req.params.id)
+    .single();
+
+  if (error) return res.status(404).json({ error: "User not found" });
+
+  // Get user's public projects
+  const { data: projects } = await client.from("projects")
+    .select("id, data")
+    .eq("user_id", req.params.id);
+
+  res.json({ ...data, projects: projects?.map(p => ({ id: p.id, ...p.data })) || [] });
+});
+
+app.patch("/api/users/subscription", authenticateToken, async (req: any, res) => {
+  const { plan } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data, error } = await client.from("users")
+    .update({ subscription_plan: plan })
+    .eq("id", req.user.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// Likes System
+app.post("/api/projects/:id/like", authenticateToken, async (req: any, res) => {
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { error } = await client.from("likes").insert([{ 
+    user_id: req.user.id, 
+    project_id: req.params.id 
+  }]);
+
+  if (error && error.code !== "23505") return res.status(500).json({ error: error.message });
+  
+  // Increment like count in project data
+  const { data: project } = await client.from("projects").select("data").eq("id", req.params.id).single();
+  if (project) {
+    const newData = { ...project.data, likes: (project.data.likes || 0) + 1 };
+    await client.from("projects").update({ data: newData }).eq("id", req.params.id);
+  }
+
+  res.json({ success: true });
+});
+
+app.delete("/api/projects/:id/like", authenticateToken, async (req: any, res) => {
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { error } = await client.from("likes")
+    .delete()
+    .eq("user_id", req.user.id)
+    .eq("project_id", req.params.id);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Decrement like count in project data
+  const { data: project } = await client.from("projects").select("data").eq("id", req.params.id).single();
+  if (project && project.data.likes > 0) {
+    const newData = { ...project.data, likes: project.data.likes - 1 };
+    await client.from("projects").update({ data: newData }).eq("id", req.params.id);
+  }
+
+  res.json({ success: true });
+});
+
+app.get("/api/projects", authenticateToken, async (req: any, res) => {
+  const userId = req.user.id;
+  await syncProjects(userId);
+  res.json(projectsByUserId[userId] || []);
+});
+
+app.get("/api/subscription", authenticateToken, async (req: any, res) => {
+  const userId = req.user.id;
+  const sub = await getUserSubscription(userId);
+  res.json(sub);
 });
 
 app.get("/api/db/status", async (req, res) => {
@@ -332,55 +541,74 @@ app.get("/api/db/status", async (req, res) => {
   });
 });
 
-app.post("/api/subscription/redeem", async (req, res) => {
-  const { code } = req.body;
-
-  // Master Admin Key Check
-  if (code === "ADMIN-MASTER-ACCESS-2026") {
-    userSubscription = { type: "ADMIN", limit: 999 };
-    await saveSubscription();
-    return res.json({ message: "Master Access Granted", subscription: userSubscription });
-  }
-
-  const keyIndex = keys.findIndex(k => k.code === code && !k.used);
+app.get("/api/admin/stats", authenticateToken, async (req, res) => {
+  const allProjects = Object.values(projectsByUserId).flat();
+  const activeBots = allProjects.filter(p => p.status === "running").length;
+  const totalStorage = Math.round(getDirSize(PROJECTS_DIR) / 1024 / 1024); // MB
   
-  if (keyIndex === -1) {
-    return res.status(400).json({ error: "Invalid or already used key" });
-  }
-
-  const key = keys[keyIndex];
-  key.used = true;
-  await saveKeys();
-
-  if (key.type === "PRO") {
-    userSubscription = { type: "PRO", limit: 5 };
-  } else if (key.type === "ULTIMATE_PRO") {
-    userSubscription = { type: "ULTIMATE_PRO", limit: 10 };
-  } else if (key.type === "ADMIN") {
-    userSubscription = { type: "ADMIN", limit: 999 };
-  }
-  await saveSubscription();
-
-  res.json({ message: `Successfully upgraded to ${key.type}`, subscription: userSubscription });
+  res.json({
+    totalBots: allProjects.length,
+    activeBots,
+    maintenanceMode,
+    totalStorage,
+    recentActivity: recentActivity.slice(0, 10)
+  });
 });
 
-app.get("/api/admin/keys", async (req, res) => {
-  await syncKeysWithSupabase();
-  res.json(keys);
-});
-
-app.post("/api/admin/keys/generate", async (req, res) => {
-  const { type } = req.body;
-  if (type !== "PRO" && type !== "ULTIMATE_PRO" && type !== "ADMIN") {
-    return res.status(400).json({ error: "Invalid key type" });
+app.get("/api/admin/users", authenticateToken, async (req, res) => {
+  const client = getSupabase();
+  if (!client) {
+    console.error("[ADMIN] Supabase client not initialized");
+    return res.status(500).json({ error: "Database not connected" });
   }
 
-  const code = Math.random().toString(36).substring(2, 10).toUpperCase();
-  const newKey = { code, type, used: false };
-  keys.push(newKey);
-  await saveKeys();
+  console.log("[ADMIN] Fetching users for admin panel...");
+  // Use select("*") to be resilient to missing columns, then filter sensitive data
+  const { data, error } = await client.from("users")
+    .select("*")
+    .order("created_at", { ascending: false });
 
-  res.json(newKey);
+  if (error) {
+    console.error("[ADMIN] Error fetching users:", error.message);
+    // If the error is specifically about the column, we can try a fallback or just report it clearly
+    return res.status(500).json({ 
+      error: error.message,
+      hint: "Ensure the 'subscription_plan' column exists in your Supabase 'users' table."
+    });
+  }
+  
+  // Filter out sensitive data like passwords before sending to client
+  const safeUsers = (data || []).map((u: any) => ({
+    id: u.id,
+    username: u.username,
+    subscription_plan: u.subscription_plan || "Free",
+    created_at: u.created_at || new Date().toISOString()
+  }));
+
+  console.log(`[ADMIN] Found ${safeUsers.length} users.`);
+  res.json(safeUsers);
+});
+
+app.post("/api/admin/users/:id/subscription", authenticateToken, async (req, res) => {
+  const { plan } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data, error } = await client.from("users")
+    .update({ subscription_plan: plan })
+    .eq("id", req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  
+  addActivity("ADMIN", `Updated subscription for ${data.username} to ${plan}`);
+  res.json(data);
+});
+
+app.post("/api/admin/maintenance", authenticateToken, (req, res) => {
+  maintenanceMode = req.body.enabled;
+  res.json({ maintenanceMode });
 });
 
 app.get("/api/stats/storage", (req, res) => {
@@ -388,9 +616,17 @@ app.get("/api/stats/storage", (req, res) => {
   res.json({ size });
 });
 
-app.post("/api/projects", async (req, res) => {
-  if (projects.length >= userSubscription.limit) {
-    return res.status(400).json({ error: `Storage full! Your current plan (${userSubscription.type}) allows only ${userSubscription.limit} bots. Upgrade to create more.` });
+app.post("/api/projects", authenticateToken, async (req: any, res) => {
+  const userId = req.user.id;
+  const sub = await getUserSubscription(userId);
+  const userProjects = projectsByUserId[userId] || [];
+
+  if (sub.limit === 0) {
+    return res.status(403).json({ error: "You don't have an active subscription! Buy Subscription To Telegram @ItsMeJeff" });
+  }
+
+  if (userProjects.length >= sub.limit) {
+    return res.status(400).json({ error: `Storage full! Your current plan allows only ${sub.limit} bots. Buy Subscription To Telegram @ItsMeJeff` });
   }
   const id = Math.random().toString(36).substr(2, 9);
   const newProject = {
@@ -410,8 +646,9 @@ app.post("/api/projects", async (req, res) => {
     fs.mkdirSync(projectDir, { recursive: true });
   }
 
-  projects.push(newProject);
-  await saveProject(newProject);
+  if (!projectsByUserId[userId]) projectsByUserId[userId] = [];
+  projectsByUserId[userId].push(newProject);
+  await saveProject(newProject, userId);
   res.json(newProject);
 });
 
@@ -429,46 +666,52 @@ app.post("/api/upload", upload.array("files"), async (req, res) => {
   res.json({ message: "Files uploaded and persisted successfully" });
 });
 
-app.post("/api/projects/:id/start", async (req, res) => {
+app.post("/api/projects/:id/start", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
-  const project = projects.find((p) => p.id === id);
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find((p) => p.id === id);
   
   if (!project) return res.status(404).json({ error: "Project not found" });
   if (activeProcesses[id]) return res.status(400).json({ error: "Project already running" });
 
   try {
-    await startProject(id);
+    await startProject(id, userId);
     res.json(project);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post("/api/projects/:id/stop", async (req, res) => {
+app.post("/api/projects/:id/stop", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
+  const userId = req.user.id;
   const child = activeProcesses[id];
   
-  const project = projects.find(p => p.id === id);
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
   if (child) {
     child.kill();
     delete activeProcesses[id];
     if (project) {
       project.status = "stopped";
-      await saveProject(project);
+      await saveProject(project, userId);
     }
     res.json({ message: "Project stopped" });
   } else if (project && project.status === "running") {
     // Handle case where status is running but process is gone
     project.status = "stopped";
-    await saveProject(project);
+    await saveProject(project, userId);
     res.json({ message: "Project status reset to stopped" });
   } else {
     res.status(404).json({ error: "No active process found" });
   }
 });
 
-app.get("/api/projects/:id/files", async (req, res) => {
+app.get("/api/projects/:id/files", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
   const projectDir = path.join(PROJECTS_DIR, id);
   
   // If directory doesn't exist, try to hydrate from Supabase
@@ -488,22 +731,24 @@ app.get("/api/projects/:id/files", async (req, res) => {
   }
 });
 
-app.patch("/api/projects/:id", async (req, res) => {
+app.patch("/api/projects/:id", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
-  const project = projects.find(p => p.id === id);
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
   if (!project) return res.status(404).json({ error: "Project not found" });
 
   if (req.body.mainFile) project.mainFile = req.body.mainFile;
   if (req.body.name) project.name = req.body.name;
   if (req.body.env) project.env = req.body.env;
   
-  await saveProject(project);
+  await saveProject(project, userId);
   res.json(project);
 });
 
-app.delete("/api/projects/:id", async (req, res) => {
+app.delete("/api/projects/:id", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
-  const projectIndex = projects.findIndex(p => p.id === id);
+  const userId = req.user.id;
+  const projectIndex = (projectsByUserId[userId] || []).findIndex(p => p.id === id);
   
   if (projectIndex === -1) return res.status(404).json({ error: "Project not found" });
 
@@ -526,13 +771,14 @@ app.delete("/api/projects/:id", async (req, res) => {
     fs.rmSync(projectDir, { recursive: true, force: true });
   }
 
-  projects.splice(projectIndex, 1);
+  projectsByUserId[userId].splice(projectIndex, 1);
   res.json({ message: "Project deleted successfully" });
 });
 
-app.post("/api/projects/:id/install", (req, res) => {
+app.post("/api/projects/:id/install", authenticateToken, (req: any, res) => {
   const { id } = req.params;
-  const project = projects.find(p => p.id === id);
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
   if (!project) return res.status(404).json({ error: "Project not found" });
 
   const projectDir = path.join(PROJECTS_DIR, id);
@@ -702,36 +948,70 @@ io.on("connection", (socket) => {
 async function startServer() {
   // Initial sync and restart running projects
   await testSupabaseConnection();
-  await syncProjects();
-  await syncKeysWithSupabase();
-  for (const p of projects) {
-    if (p.status === "running") {
-      console.log(`[BOOT] Restarting project: ${p.name}`);
-      await startProject(p.id);
+  
+  // We don't sync all projects at boot anymore, they sync per user login
+  // But for active processes, we need to know who they belong to if we want to restart them
+  // For now, let's just sync all projects once at boot to restart running ones
+  const client = getSupabase();
+  if (client) {
+    const { data } = await client.from("projects").select("*").eq("status", "running");
+    if (data) {
+      for (const p of data) {
+        console.log(`[BOOT] Restarting project: ${p.name}`);
+        const userId = p.user_id;
+        const projectData = p.data || {};
+        
+        if (!projectsByUserId[userId]) projectsByUserId[userId] = [];
+        
+        const newProject = {
+          id: p.id,
+          name: p.name || projectData.name || "Untitled Project",
+          type: p.type || projectData.type || "node",
+          mainFile: p.main_file || projectData.mainFile || (projectData.type === "python" ? "main.py" : "index.js"),
+          createdAt: projectData.createdAt || new Date().toISOString(),
+          env: projectData.env || {},
+          status: "running",
+          metrics: { cpu: 0, memory: 0, uptime: 0, requests: 0 },
+          startTime: Date.now()
+        };
+        
+        projectsByUserId[userId].push(newProject);
+        await startProject(p.id, userId);
+      }
     }
   }
 
   // Metric collection loop
   setInterval(async () => {
+    let totalMemory = 0;
     for (const id in activeProcesses) {
       const child = activeProcesses[id];
-      const project = projects.find(p => p.id === id);
+      const project = Object.values(projectsByUserId).flat().find(p => p.id === id);
       if (child && child.pid && project) {
         try {
           const stats = await pidusage(child.pid);
+          const memoryMB = Math.round(stats.memory / 1024 / 1024);
           project.metrics = {
             cpu: Math.round(stats.cpu),
-            memory: Math.round(stats.memory / 1024 / 1024), // MB
-            uptime: Math.round((Date.now() - project.startTime) / 1000),
-            requests: project.metrics.requests || 0 // Placeholder for real request tracking
+            memory: memoryMB,
+            uptime: Math.round((Date.now() - (project.startTime || Date.now())) / 1000),
+            requests: project.metrics?.requests || 0
           };
+          totalMemory += memoryMB;
           io.to(id).emit("metrics", { projectId: id, metrics: project.metrics });
         } catch (err) {
-          // Process might have exited
           pidusage.clear();
         }
       }
     }
+    
+    // Emit global stats (total usage)
+    const totalStorage = Math.round(getDirSize(PROJECTS_DIR) / 1024 / 1024); // MB
+    io.emit("global_stats", {
+      totalMemory,
+      totalStorage,
+      timestamp: new Date().toISOString()
+    });
   }, 3000);
 
   if (process.env.NODE_ENV !== "production") {
