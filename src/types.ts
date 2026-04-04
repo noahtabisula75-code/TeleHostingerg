@@ -1,5 +1,6 @@
 export interface Project {
   id: string;
+  userId: string;
   name: string;
   status: 'running' | 'stopped';
   type: 'node' | 'python';
