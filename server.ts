@@ -1,5 +1,5 @@
 import express from "express";
-import { createServer } from "http";
+import http, { createServer } from "http";
 import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import path from "path";
@@ -18,6 +18,16 @@ import archiver from "archiver";
 const app = express();
 app.use(cookieParser());
 const httpServer = createServer(app);
+
+// Health check for 24/7 uptime services
+app.get("/api/health", (req, res) => {
+  res.json({ 
+    status: "online", 
+    timestamp: new Date().toISOString(),
+    activeBots: Object.keys(activeProcesses).length
+  });
+});
+
 const io = new Server(httpServer, {
   cors: {
     origin: "*",
@@ -334,12 +344,20 @@ const startProject = async (id: string, userId: string) => {
     });
 
     child.on("close", (code) => {
+      // Update in-memory status so UI shows it's not running
       project.status = "stopped";
       project.startTime = null;
       project.metrics = { cpu: 0, memory: 0, uptime: 0, requests: 0 };
-      saveProject(project, userId);
+      
+      // CRITICAL: We DO NOT call saveProject(project, userId) here if it was an unexpected close.
+      // This allows the server to restart the project on boot if its DB status is still 'running'.
+      // If the user explicitly stopped it via the API, the status will already be 'stopped' in the DB.
+      
       delete activeProcesses[id];
       io.to(id).emit("status_change", { projectId: id, status: "stopped" });
+      
+      // Auto-restart logic if it wasn't a deliberate stop (experimental)
+      // For now, we rely on the watchdog and boot restart.
     });
   };
 
@@ -1107,6 +1125,47 @@ async function startServer() {
     }
   }
 
+  // 24/7 Watchdog: Every 5 minutes, check database for projects that SHOULD be running but aren't
+  setInterval(async () => {
+    const client = getSupabase();
+    if (!client) return;
+
+    try {
+      const { data } = await client.from("projects").select("*").eq("status", "running");
+      if (data) {
+        for (const p of data) {
+          if (!activeProcesses[p.id]) {
+            console.log(`[WATCHDOG] Restarting dead bot: ${p.name}`);
+            const userId = p.user_id;
+            const projectData = p.data || {};
+            
+            // Ensure project is in memory
+            if (!projectsByUserId[userId]) projectsByUserId[userId] = [];
+            let inMemory = projectsByUserId[userId].find(ip => ip.id === p.id);
+            if (!inMemory) {
+               inMemory = {
+                 id: p.id,
+                 name: p.name || projectData.name || "Untitled Project",
+                 type: p.type || projectData.type || "node",
+                 mainFile: p.main_file || projectData.mainFile || (projectData.type === "python" ? "main.py" : "index.js"),
+                 createdAt: projectData.createdAt || new Date().toISOString(),
+                 env: projectData.env || {},
+                 status: "running",
+                 metrics: { cpu: 0, memory: 0, uptime: 0, requests: 0 },
+                 startTime: Date.now()
+               };
+               projectsByUserId[userId].push(inMemory);
+            }
+            
+            await startProject(p.id, userId);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[WATCHDOG] Error:", err);
+    }
+  }, 5 * 60 * 1000); // 5 minutes
+
   // Metric collection loop
   setInterval(async () => {
     let totalMemory = 0;
@@ -1139,6 +1198,20 @@ async function startServer() {
       timestamp: new Date().toISOString()
     });
   }, 3000);
+
+  // Self-ping to keep server alive (prevent scale-to-zero)
+  const APP_URL = process.env.APP_URL || process.env.VITE_APP_URL;
+  if (APP_URL) {
+    console.log(`[SYSTEM] Starting self-ping service for 24/7 uptime: ${APP_URL}`);
+    setInterval(() => {
+      const healthUrl = APP_URL.endsWith("/") ? `${APP_URL}api/health` : `${APP_URL}/api/health`;
+      if (healthUrl.startsWith("https")) {
+        https.get(healthUrl, (res) => {}).on("error", () => {});
+      } else {
+        http.get(healthUrl, (res) => {}).on("error", () => {});
+      }
+    }, 10 * 60 * 1000); // 10 minutes
+  }
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
