@@ -31,7 +31,8 @@ import {
   CloudUpload,
   RefreshCw,
   Download,
-  FileArchive
+  FileArchive,
+  Zap
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { io, Socket } from "socket.io-client";
@@ -1128,6 +1129,27 @@ export default function App() {
                   </button>
                 </div>
               )}
+
+              <div className="bg-blue-600/10 border border-blue-600/20 p-5 rounded-3xl flex flex-col sm:flex-row items-center justify-between gap-6">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-2xl bg-blue-600/20 flex items-center justify-center shrink-0">
+                    <Zap className="text-blue-500" size={24} />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white">24/7 Uptime Enabled</h3>
+                    <p className="text-xs text-zinc-400 mt-1 max-w-md">
+                      Bots now automatically restart if they crash or the server restarts. 
+                      To prevent the server from sleeping, use an external monitor on your app URL.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-col items-end gap-1">
+                  <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest leading-none">Your Health Endpoint</span>
+                  <code className="text-[10px] bg-zinc-900 border border-zinc-800 px-2 py-1 rounded-lg text-blue-400 font-mono">
+                    {window.location.origin}/api/health
+                  </code>
+                </div>
+              </div>
 
               <button 
                 onClick={() => {
