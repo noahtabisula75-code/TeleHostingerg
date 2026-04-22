@@ -26,7 +26,12 @@ import {
   User,
   Lock,
   Shield,
-  Camera
+  Camera,
+  CloudDownload,
+  CloudUpload,
+  RefreshCw,
+  Download,
+  FileArchive
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { io, Socket } from "socket.io-client";
@@ -54,7 +59,7 @@ export default function App() {
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
-  const [authSubscription, setAuthSubscription] = useState("Free");
+  const [authSubscription, setAuthSubscription] = useState("None");
   const [projects, setProjects] = useState<Project[]>([]);
   const [communityUsers, setCommunityUsers] = useState<any[]>([]);
   const [selectedUser, setSelectedUser] = useState<any | null>(null);
@@ -75,7 +80,7 @@ export default function App() {
   });
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [subscription, setSubscription] = useState({ type: "PRO", limit: 100, duration: "Lifetime" });
+  const [subscription, setSubscription] = useState({ type: "None", limit: -1, duration: "None" });
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
   const [adminPassword, setAdminPassword] = useState("");
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
@@ -145,9 +150,15 @@ export default function App() {
 
   useEffect(() => {
     if (user) {
+      handleFetchDbStatus();
       setProfileUsername(user.username || "");
       setProfileBio((user as any).bio || "");
       setProfileAvatarUrl((user as any).avatar_url || "");
+      
+      // Whitelist TeleHostOwner as Admin
+      if (user.username === "TeleHostOwner") {
+        setIsAdminAuthenticated(true);
+      }
     }
   }, [user]);
 
@@ -544,7 +555,7 @@ export default function App() {
   const handleCreateProject = async () => {
     if (!newProjectName) return;
     if (subscription.limit === 0 || projects.length >= subscription.limit) {
-      alert(`You don't have an active subscription or storage full! Buy Subscription To Telegram @ItsMeJeff`);
+      alert(`You didn't subscribe any plans please contact admin to get access.`);
       return;
     }
     const res = await apiFetch("/api/projects", {
@@ -574,6 +585,81 @@ export default function App() {
 
   const handleInstallDependencies = async (id: string) => {
     await apiFetch(`/api/projects/${id}/install`, { method: "POST" });
+  };
+
+  const [isSyncingFiles, setIsSyncingFiles] = useState(false);
+  const handleSyncFiles = async (id: string) => {
+    setIsSyncingFiles(true);
+    try {
+      const res = await apiFetch(`/api/projects/${id}/sync-files`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        alert(data.message);
+        fetchProjectFiles(id);
+      } else {
+        alert(data.error);
+      }
+    } catch (error) {
+      alert("Failed to sync files from database");
+    } finally {
+      setIsSyncingFiles(false);
+    }
+  };
+
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const handlePushToCloud = async (id: string) => {
+    setIsBackingUp(true);
+    try {
+      const res = await apiFetch(`/api/projects/${id}/backup`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        alert("Project successfully backed up to database!");
+      } else {
+        alert(data.error || "Backup failed");
+      }
+    } catch (err) {
+      alert("Error during cloud backup");
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
+  const handleDownloadZip = async (id: string, name: string) => {
+    try {
+      const res = await apiFetch(`/api/projects/${id}/zip`);
+      if (!res.ok) throw new Error("Download failed");
+      
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${name.replace(/\s+/g, "_")}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      a.remove();
+    } catch (error) {
+      alert("Failed to download ZIP. Please try again.");
+    }
+  };
+
+  const handleDownloadFile = async (projectId: string, fileName: string) => {
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/files/${fileName}`);
+      if (!res.ok) throw new Error("Download failed");
+      
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      a.remove();
+    } catch (error) {
+      alert("Failed to download file. Please try again.");
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -723,29 +809,6 @@ export default function App() {
                       className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all"
                     />
                   </div>
-
-                  {authMode === "register" && (
-                    <div className="space-y-2">
-                      <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 ml-1">Select Subscription</label>
-                      <div className="grid grid-cols-2 gap-3">
-                        {["Free", "Pro", "Enterprise", "Lifetime"].map((plan) => (
-                          <button
-                            key={plan}
-                            type="button"
-                            onClick={() => setAuthSubscription(plan)}
-                            className={cn(
-                              "px-4 py-3 rounded-xl text-xs font-bold border transition-all",
-                              authSubscription === plan 
-                                ? "bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-900/20" 
-                                : "bg-zinc-900 border-zinc-800 text-zinc-500 hover:border-zinc-700"
-                            )}
-                          >
-                            {plan}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </div>
 
                 <button 
@@ -846,8 +909,17 @@ export default function App() {
             <div className="flex items-center justify-between px-2 mb-3">
               <h2 className="text-[11px] font-bold uppercase tracking-widest text-zinc-500">Projects</h2>
               <button 
-                onClick={() => setIsNewProjectModalOpen(true)}
-                className="p-1 hover:bg-zinc-800 rounded-md transition-colors text-zinc-400 hover:text-white"
+                onClick={() => {
+                  if (subscription.limit === 0) {
+                    alert("You didn't subscribe any plans please contact admin to get access.");
+                    return;
+                  }
+                  setIsNewProjectModalOpen(true);
+                }}
+                className={cn(
+                  "p-1 hover:bg-zinc-800 rounded-md transition-colors text-zinc-400 hover:text-white",
+                  subscription.limit === 0 && "opacity-50 cursor-not-allowed"
+                )}
               >
                 <Plus size={16} />
               </button>
@@ -1029,7 +1101,33 @@ export default function App() {
             <div className="max-w-4xl mx-auto space-y-10">
               <div className="flex items-center justify-between">
                 <h1 className="text-4xl font-bold tracking-tight">Dashboard</h1>
+                {dbStatus && (
+                  <div className={cn(
+                    "flex items-center gap-2 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all",
+                    dbStatus.connected ? "bg-green-500/10 border-green-500/20 text-green-500" : "bg-red-500/10 border-red-500/20 text-red-500"
+                  )}>
+                    <div className={cn("w-1.5 h-1.5 rounded-full", dbStatus.connected ? "bg-green-500 animate-pulse" : "bg-red-500")} />
+                    {dbStatus.connected ? "Cloud Connected" : "Local Only"}
+                  </div>
+                )}
               </div>
+
+              {!dbStatus?.connected && (
+                <div className="bg-orange-600/10 border border-orange-600/20 p-4 rounded-2xl flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <AlertCircle className="text-orange-500 shrink-0" size={20} />
+                    <p className="text-xs text-orange-200/70 leading-relaxed italic">
+                      Database not connected. Project backups and file restoration are currently unavailable.
+                    </p>
+                  </div>
+                  <button 
+                    onClick={handleFetchDbStatus}
+                    className="shrink-0 text-[10px] font-bold uppercase tracking-widest text-orange-500 hover:text-orange-400 transition-colors"
+                  >
+                    Check Again
+                  </button>
+                </div>
+              )}
 
               <button 
                 onClick={() => {
@@ -1166,6 +1264,13 @@ export default function App() {
                           <Heart size={14} fill={project.likes ? "currentColor" : "none"} />
                           <span className="text-xs font-bold">{project.likes || 0}</span>
                         </button>
+                        <button 
+                          onClick={() => handleDownloadZip(project.id, project.name)}
+                          className="p-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-500 hover:text-white rounded-xl transition-all border border-transparent hover:border-zinc-700 flex items-center justify-center"
+                          title="Download Project ZIP"
+                        >
+                          <FileArchive size={14} />
+                        </button>
                         {project.status === "stopped" ? (
                           <button 
                             onClick={() => handleStartProject(project.id)}
@@ -1283,6 +1388,14 @@ export default function App() {
                   )}
 
                   <button 
+                    onClick={() => handleDownloadZip(selectedProject.id, selectedProject.name)}
+                    className="flex items-center gap-2 px-5 py-2.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-300 rounded-xl font-bold text-sm transition-all shadow-lg active:scale-95"
+                  >
+                    <FileArchive size={16} />
+                    <span>Download Source (ZIP)</span>
+                  </button>
+
+                  <button 
                     onClick={() => handleDeleteProject(selectedProject.id)}
                     className="p-2.5 bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-red-500 rounded-xl transition-all hover:border-red-500/30 active:scale-95"
                     title="Delete Project"
@@ -1318,29 +1431,74 @@ export default function App() {
                       <Folder size={16} className="text-zinc-500" />
                       <span className="text-xs font-bold uppercase tracking-widest text-zinc-400">Project Files</span>
                     </div>
+                    {selectedProjectId && (
+                      <div className="flex gap-1">
+                        <button 
+                          onClick={() => handlePushToCloud(selectedProjectId)}
+                          disabled={isBackingUp}
+                          className="p-1.5 bg-zinc-800/50 hover:bg-zinc-800 rounded-md text-zinc-500 hover:text-white transition-all disabled:opacity-50"
+                          title="Backup Files to Cloud"
+                        >
+                          <CloudUpload size={14} className={isBackingUp ? "animate-pulse" : ""} />
+                        </button>
+                        <button 
+                          onClick={() => handleSyncFiles(selectedProjectId)}
+                          disabled={isSyncingFiles}
+                          className="p-1.5 bg-zinc-800/50 hover:bg-zinc-800 rounded-md text-zinc-500 hover:text-white transition-all disabled:opacity-50"
+                          title="Restore Files from Cloud"
+                        >
+                          <CloudDownload size={14} className={isSyncingFiles ? "animate-pulse" : ""} />
+                        </button>
+                        <button 
+                          onClick={() => handleDownloadZip(selectedProjectId, selectedProject?.name || "project")}
+                          className="flex items-center gap-1.5 px-3 py-1 bg-zinc-800/50 hover:bg-zinc-800 rounded-md text-[10px] font-bold uppercase tracking-wider text-zinc-400 hover:text-white transition-all"
+                          title="Download All as ZIP"
+                        >
+                          <FileArchive size={12} />
+                          <span>ZIP</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                   <div className="flex-1 overflow-y-auto p-3 custom-scrollbar space-y-1">
                     {projectFiles.length > 0 ? (
                       projectFiles.map(file => (
-                        <button
-                          key={file}
-                          onClick={() => handleSetMainFile(file)}
-                          className={cn(
-                            "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all group",
-                            selectedProject?.mainFile === file 
-                              ? "bg-blue-600/10 text-blue-500 border border-blue-600/20" 
-                              : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-transparent"
-                          )}
-                        >
-                          {file.endsWith('.py') ? <Cpu size={14} /> : <FileCode size={14} />}
-                          <span className="flex-1 text-left truncate font-medium">{file}</span>
-                          {selectedProject?.mainFile === file && <CheckCircle2 size={14} className="text-blue-500" />}
-                        </button>
+                        <div key={file} className="flex gap-1 group/file">
+                          <button
+                            onClick={() => handleSetMainFile(file)}
+                            className={cn(
+                              "flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all group",
+                              selectedProject?.mainFile === file 
+                                ? "bg-blue-600/10 text-blue-500 border border-blue-600/20" 
+                                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-transparent"
+                            )}
+                          >
+                            {file.endsWith('.py') ? <Cpu size={14} /> : <FileCode size={14} />}
+                            <span className="flex-1 text-left truncate font-medium">{file}</span>
+                            {selectedProject?.mainFile === file && <CheckCircle2 size={14} className="text-blue-500" />}
+                          </button>
+                          <button 
+                            onClick={() => handleDownloadFile(selectedProjectId, file)}
+                            className="p-2.5 text-zinc-600 hover:text-white hover:bg-zinc-800 rounded-xl transition-all self-center flex items-center justify-center opacity-0 group-hover/file:opacity-100 focus:opacity-100"
+                            title="Download File"
+                          >
+                            <Download size={14} />
+                          </button>
+                        </div>
                       ))
                     ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-zinc-600 gap-2 p-4">
-                        <AlertCircle size={24} strokeWidth={1} />
-                        <p className="text-xs text-center">No files uploaded yet.</p>
+                      <div className="h-full flex flex-col items-center justify-center text-zinc-600 gap-3 p-8">
+                        <div className="w-12 h-12 bg-zinc-900 rounded-full flex items-center justify-center mb-2">
+                          <AlertCircle size={24} strokeWidth={1.5} className="text-zinc-700" />
+                        </div>
+                        <p className="text-xs font-medium text-center leading-relaxed">No files found locally.</p>
+                        <button 
+                          onClick={() => handleSyncFiles(selectedProjectId!)}
+                          className="text-[10px] font-bold uppercase tracking-widest text-blue-500 hover:text-blue-400 flex items-center gap-2 mt-2"
+                        >
+                          <CloudDownload size={14} />
+                          <span>Restore from Cloud</span>
+                        </button>
                       </div>
                     )}
                   </div>
@@ -2107,6 +2265,36 @@ export default function App() {
               </div>
             </motion.div>
           </div>
+        )}
+      </AnimatePresence>
+
+      {/* No Subscription Overlay */}
+      <AnimatePresence>
+        {user && subscription.limit === 0 && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="fixed inset-0 z-[200] bg-black/90 backdrop-blur-xl flex items-center justify-center p-6 text-center"
+          >
+            <div className="max-w-md space-y-6">
+              <div className="w-20 h-20 bg-red-600/20 border border-red-600/30 rounded-full flex items-center justify-center mx-auto mb-6">
+                <Shield className="text-red-500" size={40} />
+              </div>
+              <h2 className="text-3xl font-black tracking-tight text-white uppercase italic">Access Restricted</h2>
+              <p className="text-zinc-400 text-lg font-medium leading-relaxed">
+                You didn't subscribe any plans please contact admin to get access.
+              </p>
+              <div className="pt-6">
+                <button 
+                  onClick={handleLogout}
+                  className="px-8 py-4 bg-zinc-800 hover:bg-zinc-700 text-white rounded-2xl font-bold transition-all active:scale-95 flex items-center gap-3 mx-auto"
+                >
+                  <LogOut size={18} />
+                  <span>Logout</span>
+                </button>
+              </div>
+            </div>
+          </motion.div>
         )}
       </AnimatePresence>
 
