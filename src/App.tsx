@@ -1130,6 +1130,7 @@ export default function App() {
                 </div>
               )}
 
+
               <button 
                 onClick={() => {
                   setIsNewProjectModalOpen(true);
