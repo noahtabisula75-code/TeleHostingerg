@@ -826,6 +826,32 @@ app.get("/api/projects/:id/zip", authenticateToken, (req: any, res) => {
   archive.finalize();
 });
 
+app.get("/api/projects/:id/zip", authenticateToken, (req: any, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
+  const projectDir = path.join(PROJECTS_DIR, id);
+  if (!fs.existsSync(projectDir)) {
+    return res.status(404).json({ error: "Project folder not found" });
+  }
+
+  const archive = archiver("zip", {
+    zlib: { level: 9 } // Sets the compression level.
+  });
+
+  res.attachment(`${project.name.replace(/\s+/g, "_")}.zip`);
+
+  archive.on("error", (err) => {
+    res.status(500).send({ error: err.message });
+  });
+
+  archive.pipe(res);
+  archive.directory(projectDir, false);
+  archive.finalize();
+});
+
 app.patch("/api/projects/:id", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
   const userId = req.user.id;
