@@ -371,6 +371,20 @@ let cachedBannedData = { ips: [], userIds: [] };
 let lastBannedFetch = 0;
 const userIpsCache: { [key: string]: string } = {};
 
+const getPasswordResets = async () => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data, error } = await client.from("settings").select("data").eq("id", "password_resets").single();
+  if (error && error.code !== "PGRST116") console.error("[RESETS] Error fetching:", error);
+  return (data?.data || []) as any[];
+};
+
+const savePasswordResets = async (resets: any[]) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from("settings").upsert({ id: "password_resets", data: resets });
+};
+
 const getBannedData = async () => {
   if (Date.now() - lastBannedFetch < 60000) return cachedBannedData;
   const client = getSupabase();
@@ -405,10 +419,6 @@ app.use("/api", async (req, res, next) => {
   const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip).split(',')[0].trim();
   const bannedData = await getBannedData();
   
-  if (bannedData.ips.includes(ip)) {
-    return res.status(403).json({ error: "Access denied. Your device/IP has been permanently banned." });
-  }
-  
   const token = req.cookies.token || req.headers.authorization?.split(" ")[1];
   if (token) {
     try {
@@ -418,11 +428,6 @@ app.use("/api", async (req, res, next) => {
       userIpsCache[user.id] = ip;
       
       if (bannedData.userIds.includes(user.id)) {
-        // Capture their IP into the explicit banned list if they tried to use a banned token
-        if (!bannedData.ips.includes(ip)) {
-          bannedData.ips.push(ip);
-          await saveBannedData(bannedData);
-        }
         return res.status(403).json({ error: "Access denied. Your account has been permanently banned." });
       }
     } catch(e) {}
@@ -444,12 +449,8 @@ app.post("/api/admin/users/:id/ban", authenticateToken, async (req: any, res: an
   
   if (ban) {
     if (!bannedData.userIds.includes(userId)) bannedData.userIds.push(userId);
-    if (ip && !bannedData.ips.includes(ip)) bannedData.ips.push(ip);
   } else {
     bannedData.userIds = bannedData.userIds.filter((id: string) => id !== userId);
-    if (ip) {
-      bannedData.ips = bannedData.ips.filter((i: string) => i !== ip);
-    }
   }
   
   await saveBannedData(bannedData);
@@ -499,12 +500,6 @@ app.post("/api/auth/login", async (req, res) => {
 
   const bannedData = await getBannedData();
   if (bannedData.userIds.includes(data.id)) {
-    // Also track the IP since we know they are trying to login
-    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip).split(',')[0].trim();
-    if (!bannedData.ips.includes(ip)) {
-      bannedData.ips.push(ip);
-      await saveBannedData(bannedData);
-    }
     return res.status(403).json({ error: "Access denied. Your account has been permanently banned." });
   }
 
@@ -520,6 +515,51 @@ app.post("/api/auth/login", async (req, res) => {
     maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
   });
   res.json({ token, user: { id: data.id, username: data.username } });
+});
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const { username } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const { data: user, error: userError } = await client.from("users").select("id").eq("username", username).single();
+  if (userError || !user) return res.status(404).json({ error: "User not found" });
+
+  const resets = await getPasswordResets();
+  const existing = resets.find(r => r.username === username);
+
+  if (existing) {
+    return res.json({ status: existing.status, message: existing.status === "pending" ? "Your request is pending approval by an admin." : "Your request is approved. You can now reset your password." });
+  }
+
+  resets.push({ username, status: "pending", timestamp: Date.now() });
+  await savePasswordResets(resets);
+
+  res.json({ status: "pending", message: "Request sent to admin. Please check back later." });
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { username, newPassword } = req.body;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+
+  const resets = await getPasswordResets();
+  const resetIdx = resets.findIndex(r => r.username === username);
+
+  if (resetIdx === -1 || resets[resetIdx].status !== "approved") {
+    return res.status(403).json({ error: "No approved reset request found for this user." });
+  }
+
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+  const { error: updateError } = await client.from("users").update({ password: hashedPassword }).eq("username", username);
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  // Remove the reset request
+  resets.splice(resetIdx, 1);
+  await savePasswordResets(resets);
+
+  res.json({ success: true, message: "Password updated successfully! You can now login." });
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -735,6 +775,28 @@ app.get("/api/admin/users", authenticateToken, async (req, res) => {
 
   console.log(`[ADMIN] Found ${safeUsers.length} users.`);
   res.json(safeUsers);
+});
+
+app.get("/api/admin/password-resets", authenticateToken, async (req, res) => {
+  const resets = await getPasswordResets();
+  res.json(resets);
+});
+
+app.post("/api/admin/password-resets/:username/:action", authenticateToken, async (req, res) => {
+  const { username, action } = req.params;
+  const resets = await getPasswordResets();
+  const resetIdx = resets.findIndex(r => r.username === username);
+
+  if (resetIdx === -1) return res.status(404).json({ error: "Reset request not found" });
+
+  if (action === "approve") {
+    resets[resetIdx].status = "approved";
+  } else if (action === "reject") {
+    resets.splice(resetIdx, 1);
+  }
+
+  await savePasswordResets(resets);
+  res.json({ success: true });
 });
 
 app.post("/api/admin/users/:id/subscription", authenticateToken, async (req, res) => {
