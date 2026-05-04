@@ -32,7 +32,8 @@ import {
   RefreshCw,
   Download,
   FileArchive,
-  Zap
+  Zap,
+  UserX
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { io, Socket } from "socket.io-client";
@@ -57,9 +58,10 @@ const formatUptime = (seconds: number) => {
 export default function App() {
   const [user, setUser] = useState<{ id: string; username: string; subscription_plan?: string; created_at?: string } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
-  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authMode, setAuthMode] = useState<"login" | "register" | "forgot_password" | "reset_password">("login");
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
+  const [authConfirmPassword, setAuthConfirmPassword] = useState("");
   const [authSubscription, setAuthSubscription] = useState("None");
   const [projects, setProjects] = useState<Project[]>([]);
   const [communityUsers, setCommunityUsers] = useState<any[]>([]);
@@ -102,6 +104,7 @@ export default function App() {
 
   const [adminUsers, setAdminUsers] = useState<any[]>([]);
   const [isAdminUsersLoading, setIsAdminUsersLoading] = useState(false);
+  const [adminPasswordResets, setAdminPasswordResets] = useState<any[]>([]);
 
   // Profile Settings State
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
@@ -294,6 +297,54 @@ export default function App() {
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    if (authMode === "forgot_password") {
+      if (!authUsername) return;
+      setIsAuthLoading(true);
+      try {
+        const res = await fetch(`/api/auth/forgot-password`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: authUsername }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert(data.message);
+          if (data.status === "approved") {
+            setAuthMode("reset_password");
+          }
+        } else {
+          alert(data.error);
+        }
+      } catch (err) { alert("Failed to connect"); }
+      setIsAuthLoading(false);
+      return;
+    }
+
+    if (authMode === "reset_password") {
+      if (!authUsername || !authPassword || !authConfirmPassword) return;
+      if (authPassword !== authConfirmPassword) {
+        alert("Passwords do not match"); return;
+      }
+      setIsAuthLoading(true);
+      try {
+        const res = await fetch(`/api/auth/reset-password`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: authUsername, newPassword: authPassword }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert(data.message);
+          setAuthMode("login");
+        } else {
+          alert(data.error);
+        }
+      } catch (err) { alert("Failed to connect"); }
+      setIsAuthLoading(false);
+      return;
+    }
+
     if (!authUsername || !authPassword) return;
     setIsAuthLoading(true);
     try {
@@ -513,12 +564,31 @@ export default function App() {
           alert("Failed to fetch users: " + (data.error || "Unknown error"));
         }
       }
+      
+      const resetRes = await apiFetch("/api/admin/password-resets");
+      if (resetRes.ok) {
+        setAdminPasswordResets(await resetRes.json());
+      }
     } catch (error) {
       console.error("Failed to fetch admin users:", error);
       alert("Failed to fetch admin users. Check console for details.");
     } finally {
       setIsAdminUsersLoading(false);
     }
+  };
+
+  const handleAdminResetAction = async (username: string, action: 'approve'|'reject') => {
+    try {
+      const res = await apiFetch(`/api/admin/password-resets/${username}/${action}`, { method: "POST" });
+      if (res.ok) {
+        setAdminPasswordResets(prev => {
+          if (action === 'reject') return prev.filter(r => r.username !== username);
+          return prev.map(r => r.username === username ? { ...r, status: 'approved' } : r);
+        });
+      } else {
+        alert("Failed to action reset request");
+      }
+    } catch (e) { alert("Failed to action reset request"); }
   };
 
   const handleAdminUpdateSubscription = async (userId: string, plan: string) => {
@@ -831,7 +901,12 @@ export default function App() {
                   <Bot className="text-white" size={40} />
                 </div>
                 <h1 className="text-4xl font-black tracking-tighter uppercase italic">BotHost <span className="text-blue-500">Pro</span></h1>
-                <p className="text-zinc-500 font-medium">{authMode === "login" ? "Welcome back! Please login." : "Create an account to start hosting."}</p>
+                <p className="text-zinc-500 font-medium whitespace-pre-wrap">
+                  {authMode === "login" ? "Welcome back! Please login." : 
+                   authMode === "register" ? "Create an account to start hosting." : 
+                   authMode === "forgot_password" ? "Enter your username to request a password reset.\nAn admin will need to approve it." :
+                   "Set your new password."}
+                </p>
               </div>
 
               <form onSubmit={handleAuth} className="bg-zinc-900/50 border border-zinc-800 p-8 rounded-3xl space-y-6 backdrop-blur-xl">
@@ -843,40 +918,78 @@ export default function App() {
                       value={authUsername}
                       onChange={(e) => setAuthUsername(e.target.value)}
                       placeholder="Enter username"
-                      className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all"
+                      className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all disabled:opacity-50"
+                      disabled={authMode === "reset_password"}
                     />
                   </div>
-                  <div className="space-y-2">
-                    <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 ml-1">Password</label>
-                    <input 
-                      type="password" 
-                      value={authPassword}
-                      onChange={(e) => setAuthPassword(e.target.value)}
-                      placeholder="••••••••"
-                      className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all"
-                    />
-                  </div>
+                  {authMode !== "forgot_password" && (
+                    <div className="space-y-2">
+                      <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 ml-1">
+                        {authMode === "reset_password" ? "New Password" : "Password"}
+                      </label>
+                      <input 
+                        type="password" 
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all"
+                      />
+                    </div>
+                  )}
+                  {authMode === "reset_password" && (
+                    <div className="space-y-2">
+                      <label className="block text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 ml-1">Confirm New Password</label>
+                      <input 
+                        type="password" 
+                        value={authConfirmPassword}
+                        onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full bg-[#0a0a0a] border border-zinc-800 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:border-blue-600 transition-all"
+                      />
+                    </div>
+                  )}
                 </div>
 
-                <button 
-                  type="submit"
-                  disabled={!authUsername || !authPassword || isAuthLoading}
-                  className="w-full py-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-2xl font-bold text-sm transition-all shadow-xl shadow-blue-900/20 flex items-center justify-center gap-3 group"
-                >
-                  {isAuthLoading ? (
-                    <Activity className="animate-spin" size={18} />
-                  ) : (
-                    <>
-                      <span>{authMode === "login" ? "Login" : "Register"}</span>
-                      <ChevronRight size={18} className="group-hover:translate-x-1 transition-transform" />
-                    </>
+                <div className="flex flex-col gap-3">
+                  <button 
+                    type="submit"
+                    disabled={isAuthLoading || !authUsername || (authMode !== "forgot_password" && !authPassword) || (authMode === "reset_password" && !authConfirmPassword)}
+                    className="w-full py-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-2xl font-bold text-sm transition-all shadow-xl shadow-blue-900/20 flex items-center justify-center gap-3 group"
+                  >
+                    {isAuthLoading ? (
+                      <Activity className="animate-spin" size={18} />
+                    ) : (
+                      <>
+                        <span>
+                          {authMode === "login" ? "Login" : 
+                           authMode === "register" ? "Register" : 
+                           authMode === "forgot_password" ? "Request Reset" :
+                           "Save Password"}
+                        </span>
+                        <ChevronRight size={18} className="group-hover:translate-x-1 transition-transform" />
+                      </>
+                    )}
+                  </button>
+                  
+                  {authMode === "login" && (
+                    <button 
+                      type="button"
+                      onClick={() => setAuthMode("forgot_password")}
+                      className="text-xs text-zinc-500 hover:text-blue-500 transition-colors font-medium text-center"
+                    >
+                      Forgot your password?
+                    </button>
                   )}
-                </button>
+                </div>
 
-                <div className="text-center">
+                <div className="text-center mt-2">
                   <button 
                     type="button"
-                    onClick={() => setAuthMode(authMode === "login" ? "register" : "login")}
+                    onClick={() => {
+                      setAuthMode(authMode === "login" ? "register" : "login");
+                      setAuthPassword("");
+                      setAuthConfirmPassword("");
+                    }}
                     className="text-xs text-zinc-500 hover:text-blue-500 transition-colors font-medium"
                   >
                     {authMode === "login" ? "Don't have an account? Register" : "Already have an account? Login"}
@@ -2191,6 +2304,72 @@ export default function App() {
                         </div>
                       ) : (
                         <div className="text-center py-10 text-zinc-600 italic">No users found</div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Password Resets */}
+                  <div className="p-6 border-t border-zinc-800">
+                    <div className="flex items-center justify-between mb-6">
+                      <div className="flex items-center gap-2">
+                        <UserX size={14} className="text-red-500" />
+                        <h3 className="text-[10px] font-bold uppercase tracking-widest text-zinc-400">Password Reset Requests</h3>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      {isAdminUsersLoading ? (
+                        <div className="py-10 flex justify-center">
+                          <div className="w-6 h-6 border-2 border-zinc-800 border-t-red-500 rounded-full animate-spin" />
+                        </div>
+                      ) : adminPasswordResets.length > 0 ? (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-zinc-800">
+                                <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600">User</th>
+                                <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600">Status</th>
+                                <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600 text-right">Actions</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {adminPasswordResets.map((r, i) => (
+                                <tr key={i} className="border-b border-zinc-800/50 hover:bg-zinc-900/30 transition-colors">
+                                  <td className="py-4 px-4">
+                                    <span className="text-sm font-bold text-zinc-200">{r.username}</span>
+                                    <div className="text-[10px] text-zinc-600">{new Date(r.timestamp).toLocaleString()}</div>
+                                  </td>
+                                  <td className="py-4 px-4">
+                                    <span className={cn(
+                                      "px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest",
+                                      r.status === "approved" ? "bg-emerald-500/10 text-emerald-500 border border-emerald-500/20" : "bg-amber-500/10 text-amber-500 border border-amber-500/20"
+                                    )}>
+                                      {r.status}
+                                    </span>
+                                  </td>
+                                  <td className="py-4 px-4 flex justify-end gap-2">
+                                    {r.status === "pending" && (
+                                      <button
+                                        onClick={() => handleAdminResetAction(r.username, 'approve')}
+                                        className="px-3 py-1 rounded text-[9px] font-bold uppercase tracking-widest transition-all border bg-emerald-500/10 border-emerald-500/20 text-emerald-500 hover:bg-emerald-500/20"
+                                      >
+                                        Approve
+                                      </button>
+                                    )}
+                                    <button
+                                      onClick={() => handleAdminResetAction(r.username, 'reject')}
+                                      className="px-3 py-1 rounded text-[9px] font-bold uppercase tracking-widest transition-all border bg-red-500/10 border-red-500/20 text-red-500 hover:bg-red-500/20"
+                                    >
+                                      Reject
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="text-center py-10 text-zinc-600 italic border border-dashed border-zinc-800 rounded-2xl">No pending reset requests</div>
                       )}
                     </div>
                   </div>
