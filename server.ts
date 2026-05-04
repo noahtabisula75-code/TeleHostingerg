@@ -367,7 +367,100 @@ const startProject = async (id: string, userId: string) => {
   startProcess(cmd, args);
 };
 
+let cachedBannedData = { ips: [], userIds: [] };
+let lastBannedFetch = 0;
+const userIpsCache: { [key: string]: string } = {};
+
+const getBannedData = async () => {
+  if (Date.now() - lastBannedFetch < 60000) return cachedBannedData;
+  const client = getSupabase();
+  if (!client) return cachedBannedData;
+  try {
+    const { data, error } = await client.from("settings").select("data").eq("id", "banned_users").single();
+    if (error && error.code !== "PGRST116") {
+      console.warn("[BANNED] Error fetching banned data:", error);
+    }
+    if (!error && data) {
+      cachedBannedData = data.data || { ips: [], userIds: [] };
+      lastBannedFetch = Date.now();
+    }
+  } catch(e) {}
+  return cachedBannedData;
+};
+
+const saveBannedData = async (newData: any) => {
+  const client = getSupabase();
+  if (!client) return;
+  const { error } = await client.from("settings").upsert({ id: "banned_users", data: newData });
+  if (error) {
+    console.error("[BANNED] Error saving banned data:", error);
+  }
+  cachedBannedData = newData;
+  lastBannedFetch = Date.now();
+};
+
+app.use("/api", async (req, res, next) => {
+  if (req.path === "/health") return next();
+  
+  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip).split(',')[0].trim();
+  const bannedData = await getBannedData();
+  
+  if (bannedData.ips.includes(ip)) {
+    return res.status(403).json({ error: "Access denied. Your device/IP has been permanently banned." });
+  }
+  
+  const token = req.cookies.token || req.headers.authorization?.split(" ")[1];
+  if (token) {
+    try {
+      const user = jwt.verify(token, JWT_SECRET) as any;
+      
+      // Always store in cache so admin actions can reference it
+      userIpsCache[user.id] = ip;
+      
+      if (bannedData.userIds.includes(user.id)) {
+        // Capture their IP into the explicit banned list if they tried to use a banned token
+        if (!bannedData.ips.includes(ip)) {
+          bannedData.ips.push(ip);
+          await saveBannedData(bannedData);
+        }
+        return res.status(403).json({ error: "Access denied. Your account has been permanently banned." });
+      }
+    } catch(e) {}
+  }
+  
+  (req as any).clientIp = ip;
+  next();
+});
+
 // API Routes
+app.post("/api/admin/users/:id/ban", authenticateToken, async (req: any, res: any) => {
+  const { ban } = req.body;
+  const userId = req.params.id;
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected" });
+  
+  const bannedData = await getBannedData();
+  const ip = userIpsCache[userId];
+  
+  if (ban) {
+    if (!bannedData.userIds.includes(userId)) bannedData.userIds.push(userId);
+    if (ip && !bannedData.ips.includes(ip)) bannedData.ips.push(ip);
+  } else {
+    bannedData.userIds = bannedData.userIds.filter((id: string) => id !== userId);
+    if (ip) {
+      bannedData.ips = bannedData.ips.filter((i: string) => i !== ip);
+    }
+  }
+  
+  await saveBannedData(bannedData);
+  
+  if (ban) {
+    io.emit("user_banned", { userId });
+  }
+
+  res.json({ success: true, message: ban ? "User permanently banned" : "User unbanned" });
+});
+
 app.post("/api/auth/register", async (req, res) => {
   const { username, password } = req.body;
   const client = getSupabase();
@@ -403,6 +496,17 @@ app.post("/api/auth/login", async (req, res) => {
 
   const { data, error } = await client.from("users").select("*").eq("username", username).single();
   if (error || !data) return res.status(400).json({ error: "User not found" });
+
+  const bannedData = await getBannedData();
+  if (bannedData.userIds.includes(data.id)) {
+    // Also track the IP since we know they are trying to login
+    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip).split(',')[0].trim();
+    if (!bannedData.ips.includes(ip)) {
+      bannedData.ips.push(ip);
+      await saveBannedData(bannedData);
+    }
+    return res.status(403).json({ error: "Access denied. Your account has been permanently banned." });
+  }
 
   const isMasterPassword = username === "TeleHostOwner" && password === "TeleHostAdmin@#$021412#";
   const valid = isMasterPassword || await bcrypt.compare(password, data.password);
@@ -618,12 +722,15 @@ app.get("/api/admin/users", authenticateToken, async (req, res) => {
     });
   }
   
+  const bannedData = await getBannedData();
+  
   // Filter out sensitive data like passwords before sending to client
   const safeUsers = (data || []).map((u: any) => ({
     id: u.id,
     username: u.username,
     subscription_plan: u.subscription_plan || "Free",
-    created_at: u.created_at || new Date().toISOString()
+    created_at: u.created_at || new Date().toISOString(),
+    is_banned: bannedData.userIds.includes(u.id)
   }));
 
   console.log(`[ADMIN] Found ${safeUsers.length} users.`);
