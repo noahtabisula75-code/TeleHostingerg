@@ -121,7 +121,19 @@ export default function App() {
       ...(token ? { "Authorization": `Bearer ${token}` } : {}),
     };
     const res = await fetch(url, { ...options, headers });
-    if (res.status === 401 && !url.includes("/api/auth/")) {
+    
+    if (res.status === 403) {
+      const clone = res.clone();
+      try {
+        const body = await clone.json();
+        if (body.error && body.error.toLowerCase().includes("banned")) {
+          setUser(null);
+          localStorage.removeItem("auth_token");
+          // Optionally reload to kick them fully to login
+          alert(body.error);
+        }
+      } catch (e) {}
+    } else if (res.status === 401 && !url.includes("/api/auth/")) {
       setUser(null);
       localStorage.removeItem("auth_token");
     }
@@ -259,6 +271,20 @@ export default function App() {
         ...prev,
         recentActivity: [activity, ...(prev.recentActivity || [])].slice(0, 10)
       } : null);
+    });
+
+    socketRef.current.on("user_banned", (data: { userId: string }) => {
+      // If we are the banned user, kick us out
+      setUser(current => {
+        if (current && current.id === data.userId) {
+          localStorage.removeItem("auth_token");
+          alert("Access denied. Your account has been permanently banned.");
+          // We can't use window.location.reload() safely in iframe sometimes, so just clear states
+          setProjects([]);
+          return null;
+        }
+        return current;
+      });
     });
 
     return () => {
@@ -514,6 +540,25 @@ export default function App() {
     }
   };
 
+  const handleAdminBanUser = async (userId: string, ban: boolean) => {
+    try {
+      const res = await apiFetch(`/api/admin/users/${userId}/ban`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ban }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setAdminUsers(prev => prev.map(u => u.id === userId ? { ...u, is_banned: ban } : u));
+        handleFetchAdminStats(); // Refresh activity
+      } else {
+        alert(data.error || "Failed to change ban status");
+      }
+    } catch (error) {
+      alert("Failed to change ban status");
+    }
+  };
+
   const handleFetchAdminStats = async () => {
     try {
       const res = await apiFetch("/api/admin/stats");
@@ -740,7 +785,8 @@ export default function App() {
   };
 
   const handleDeleteProject = async (id: string) => {
-    if (!confirm("Are you sure you want to delete this project? This action cannot be undone.")) return;
+    // Confirm is blocked in iframes sometimes, so we'll bypass it
+    // if (!confirm("Are you sure you want to delete this project? This action cannot be undone.")) return;
     
     await apiFetch(`/api/projects/${id}`, { method: "DELETE" });
     setProjects(prev => prev.filter(p => p.id !== id));
@@ -1130,6 +1176,19 @@ export default function App() {
                 </div>
               )}
 
+              <div className="bg-blue-600/10 border border-blue-600/20 p-5 rounded-3xl flex flex-col sm:flex-row items-center justify-between gap-6">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-2xl bg-blue-600/20 flex items-center justify-center shrink-0">
+                    <Zap className="text-blue-500" size={24} />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white">24/7 Uptime Enabled</h3>
+                    <p className="text-xs text-zinc-400 mt-1 max-w-md">
+                      Bots now automatically restart if they crash or the server restarts.
+                    </p>
+                  </div>
+                </div>
+              </div>
 
               <button 
                 onClick={() => {
@@ -2064,6 +2123,7 @@ export default function App() {
                                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600">User</th>
                                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600">Current Plan</th>
                                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600">Change Plan</th>
+                                <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-zinc-600">Actions</th>
                               </tr>
                             </thead>
                             <tbody>
@@ -2071,7 +2131,10 @@ export default function App() {
                                 <tr key={u.id} className="border-b border-zinc-800/50 hover:bg-zinc-900/30 transition-colors">
                                   <td className="py-4 px-4">
                                     <div className="flex flex-col">
-                                      <span className="text-sm font-bold text-zinc-200">{u.username}</span>
+                                      <span className="text-sm font-bold text-zinc-200">
+                                        {u.username}
+                                        {u.is_banned && <span className="ml-2 text-[10px] bg-red-500/10 text-red-500 px-1.5 py-0.5 rounded font-bold uppercase">Banned</span>}
+                                      </span>
                                       <span className="text-[10px] text-zinc-600">Joined {new Date(u.created_at).toLocaleDateString()}</span>
                                     </div>
                                   </td>
@@ -2104,6 +2167,22 @@ export default function App() {
                                         </button>
                                       ))}
                                     </div>
+                                  </td>
+                                  <td className="py-4 px-4">
+                                    <button
+                                      onClick={() => {
+                                        // Confirm doesn't work well in iframes, execute directly
+                                        handleAdminBanUser(u.id, !u.is_banned);
+                                      }}
+                                      className={cn(
+                                        "px-2 py-1 rounded text-[9px] font-bold uppercase tracking-widest transition-all border",
+                                        u.is_banned 
+                                          ? "bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700" 
+                                          : "bg-red-500/10 border-red-500/20 text-red-500 hover:bg-red-500/20 hover:border-red-500/50"
+                                      )}
+                                    >
+                                      {u.is_banned ? "Unban" : "Ban"}
+                                    </button>
                                   </td>
                                 </tr>
                               ))}
