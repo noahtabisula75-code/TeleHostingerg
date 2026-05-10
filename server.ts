@@ -895,6 +895,24 @@ app.post("/api/projects/:id/stop", authenticateToken, async (req: any, res) => {
   }
 });
 
+function getAllProjFiles(dirPath: string, arrayOfFiles: string[] = [], basePath: string = ""): string[] {
+  if (!fs.existsSync(dirPath)) return arrayOfFiles;
+  const files = fs.readdirSync(dirPath);
+
+  files.forEach(function(file) {
+    const fullPath = path.join(dirPath, file);
+    const relPath = basePath ? basePath + "/" + file : file; // Use forward slash for consistency
+    if (fs.statSync(fullPath).isDirectory()) {
+      arrayOfFiles.push(relPath + "/");
+      arrayOfFiles = getAllProjFiles(fullPath, arrayOfFiles, relPath);
+    } else {
+      arrayOfFiles.push(relPath);
+    }
+  });
+
+  return arrayOfFiles;
+}
+
 app.get("/api/projects/:id/files", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
   const userId = req.user.id;
@@ -913,14 +931,14 @@ app.get("/api/projects/:id/files", authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const files = fs.readdirSync(projectDir);
+    const files = getAllProjFiles(projectDir);
     res.json(files);
   } catch (error) {
     res.status(500).json({ error: "Could not list files" });
   }
 });
 
-app.get("/api/projects/:id/files/:filename", authenticateToken, (req: any, res) => {
+app.get("/api/projects/:id/files/:filename(*)", authenticateToken, (req: any, res) => {
   const { id, filename } = req.params;
   const userId = req.user.id;
   const project = (projectsByUserId[userId] || []).find(p => p.id === id);
@@ -958,30 +976,45 @@ app.get("/api/projects/:id/zip", authenticateToken, (req: any, res) => {
   archive.finalize();
 });
 
-app.get("/api/projects/:id/zip", authenticateToken, (req: any, res) => {
+app.post("/api/projects/:id/files/manage", authenticateToken, (req: any, res) => {
   const { id } = req.params;
+  const { action, path: targetPath, newPath, isDir } = req.body;
   const userId = req.user.id;
   const project = (projectsByUserId[userId] || []).find(p => p.id === id);
   if (!project) return res.status(404).json({ error: "Project not found" });
 
   const projectDir = path.join(PROJECTS_DIR, id);
-  if (!fs.existsSync(projectDir)) {
-    return res.status(404).json({ error: "Project folder not found" });
+  const sanitizedTargetPath = targetPath ? targetPath.replace(/(\.\.[\/\\])+/g, "") : "";
+  const fullTargetPath = path.join(projectDir, sanitizedTargetPath);
+  const sanitizedNewPath = newPath ? newPath.replace(/(\.\.[\/\\])+/g, "") : "";
+  const fullNewPath = path.join(projectDir, sanitizedNewPath);
+  
+  try {
+    if (action === "create") {
+      if (isDir) {
+        fs.mkdirSync(fullNewPath, { recursive: true });
+      } else {
+        const dir = path.dirname(fullNewPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(fullNewPath, "");
+      }
+    } else if (action === "rename") {
+      fs.renameSync(fullTargetPath, fullNewPath);
+    } else if (action === "delete") {
+      if (fs.existsSync(fullTargetPath)) {
+        if (fs.statSync(fullTargetPath).isDirectory()) {
+          fs.rmSync(fullTargetPath, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(fullTargetPath);
+        }
+      }
+    } else {
+      return res.status(400).json({ error: "Invalid action" });
+    }
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
   }
-
-  const archive = archiver("zip", {
-    zlib: { level: 9 } // Sets the compression level.
-  });
-
-  res.attachment(`${project.name.replace(/\s+/g, "_")}.zip`);
-
-  archive.on("error", (err) => {
-    res.status(500).send({ error: err.message });
-  });
-
-  archive.pipe(res);
-  archive.directory(projectDir, false);
-  archive.finalize();
 });
 
 app.patch("/api/projects/:id", authenticateToken, async (req: any, res) => {
