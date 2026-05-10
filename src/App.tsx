@@ -32,7 +32,11 @@ import {
   RefreshCw,
   Download,
   FileArchive,
-  Zap
+  Zap,
+  Trash2,
+  Edit2,
+  FolderPlus,
+  FilePlus2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { io, Socket } from "socket.io-client";
@@ -67,10 +71,18 @@ export default function App() {
   const [isCommunityModalOpen, setIsCommunityModalOpen] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [projectFiles, setProjectFiles] = useState<string[]>([]);
+  const [currentPath, setCurrentPath] = useState<string>("");
   const [logs, setLogs] = useState<{ [key: string]: LogEntry[] }>({});
   const [uploadProgress, setUploadProgress] = useState<{ [fileName: string]: number }>({});
   const [isUploading, setIsUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [manageFileModal, setManageFileModal] = useState<{
+    isOpen: boolean;
+    action: "create" | "rename" | "delete";
+    isDir: boolean;
+    targetPath: string;
+  }>({ isOpen: false, action: "create", isDir: false, targetPath: "" });
+  const [manageFileInput, setManageFileInput] = useState("");
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
   const [isEnvModalOpen, setIsEnvModalOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -188,6 +200,7 @@ export default function App() {
     if (!user) return;
     if (selectedProjectId) {
       localStorage.setItem("selected_project_id", selectedProjectId);
+      setCurrentPath("");
     }
   }, [selectedProjectId, user]);
 
@@ -719,8 +732,9 @@ export default function App() {
     formData.append("projectId", selectedProjectId);
     files.forEach(file => {
       const filePath = file.webkitRelativePath || file.name;
-      formData.append("files", file, filePath);
-      setUploadProgress(prev => ({ ...prev, [filePath]: 0 }));
+      const finalPath = currentPath ? `${currentPath}/${filePath}` : filePath;
+      formData.append("files", file, finalPath);
+      setUploadProgress(prev => ({ ...prev, [finalPath]: 0 }));
     });
 
     const xhr = new XMLHttpRequest();
@@ -735,7 +749,8 @@ export default function App() {
           const next = { ...prev };
           files.forEach(file => {
             const filePath = file.webkitRelativePath || file.name;
-            next[filePath] = percent;
+            const finalPath = currentPath ? `${currentPath}/${filePath}` : filePath;
+            next[finalPath] = percent;
           });
           return next;
         });
@@ -792,6 +807,41 @@ export default function App() {
   const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
+  };
+
+  const submitFileManage = async () => {
+    if (!selectedProjectId) return;
+    try {
+      let resolvedNewPath = manageFileInput;
+      if (manageFileModal.action === "rename") {
+        const parts = manageFileModal.targetPath.split("/");
+        parts.pop();
+        if (parts.length > 0) {
+          resolvedNewPath = parts.join("/") + "/" + manageFileInput;
+        }
+      } else {
+        if (manageFileModal.targetPath) {
+           resolvedNewPath = manageFileModal.targetPath + "/" + manageFileInput;
+        }
+      }
+
+      const res = await apiFetch(`/api/projects/${selectedProjectId}/files/manage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: manageFileModal.action,
+          path: manageFileModal.targetPath,
+          newPath: resolvedNewPath,
+          isDir: manageFileModal.isDir
+        })
+      });
+      if (!res.ok) throw new Error("Failed to manage file");
+      setManageFileModal({ isOpen: false, action: "create", isDir: false, targetPath: "" });
+      setManageFileInput("");
+      fetchProjectFiles(selectedProjectId);
+    } catch (e: any) {
+      alert("Error managing file: " + e.message);
+    }
   };
 
   const handleSetMainFile = async (fileName: string) => {
@@ -1549,6 +1599,20 @@ export default function App() {
                     <div className="flex items-center gap-2">
                       <Folder size={16} className="text-zinc-500" />
                       <span className="text-xs font-bold uppercase tracking-widest text-zinc-400">Project Files</span>
+                      <div className="ml-2 flex items-center gap-1 border-l border-zinc-800 pl-2">
+                        <button 
+                          onClick={() => setManageFileModal({ isOpen: true, action: "create", isDir: true, targetPath: currentPath })}
+                          className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-white transition-all text-xs" title="New Folder"
+                        >
+                          <FolderPlus size={14} />
+                        </button>
+                        <button 
+                          onClick={() => setManageFileModal({ isOpen: true, action: "create", isDir: false, targetPath: currentPath })}
+                          className="p-1 hover:bg-zinc-800 rounded text-zinc-500 hover:text-white transition-all text-xs" title="New File"
+                        >
+                          <FilePlus2 size={14} />
+                        </button>
+                      </div>
                     </div>
                     {selectedProjectId && (
                       <div className="flex gap-1">
@@ -1612,46 +1676,129 @@ export default function App() {
                       </div>
                     ))}
 
-                    {projectFiles.length > 0 ? (
-                      projectFiles.map(file => (
-                        <div key={file} className="flex gap-1 group/file">
-                          <button
-                            onClick={() => handleSetMainFile(file)}
-                            className={cn(
-                              "flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all group",
-                              selectedProject?.mainFile === file 
-                                ? "bg-blue-600/10 text-blue-500 border border-blue-600/20" 
-                                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-transparent"
-                            )}
-                          >
-                            {file.endsWith('.py') ? <Cpu size={14} /> : <FileCode size={14} />}
-                            <span className="flex-1 text-left truncate font-medium">{file}</span>
-                            {selectedProject?.mainFile === file && <CheckCircle2 size={14} className="text-blue-500" />}
-                          </button>
-                          <button 
-                            onClick={() => handleDownloadFile(selectedProjectId, file)}
-                            className="p-2.5 text-zinc-600 hover:text-white hover:bg-zinc-800 rounded-xl transition-all self-center flex items-center justify-center opacity-0 group-hover/file:opacity-100 focus:opacity-100"
-                            title="Download File"
-                          >
-                            <Download size={14} />
-                          </button>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-zinc-600 gap-3 p-8">
-                        <div className="w-12 h-12 bg-zinc-900 rounded-full flex items-center justify-center mb-2">
-                          <AlertCircle size={24} strokeWidth={1.5} className="text-zinc-700" />
-                        </div>
-                        <p className="text-xs font-medium text-center leading-relaxed">No files found locally.</p>
-                        <button 
-                          onClick={() => handleSyncFiles(selectedProjectId!)}
-                          className="text-[10px] font-bold uppercase tracking-widest text-blue-500 hover:text-blue-400 flex items-center gap-2 mt-2"
-                        >
-                          <CloudDownload size={14} />
-                          <span>Restore from Cloud</span>
-                        </button>
-                      </div>
-                    )}
+                    {(() => {
+                      const displayFiles = projectFiles.filter(file => {
+                        const isDir = file.endsWith('/');
+                        const normalizedFile = isDir ? file.slice(0, -1) : file;
+                        
+                        if (currentPath === "") {
+                          return !normalizedFile.includes('/');
+                        } else {
+                          if (!normalizedFile.startsWith(currentPath + "/")) return false;
+                          const remainder = normalizedFile.slice(currentPath.length + 1);
+                          return remainder.length > 0 && !remainder.includes('/');
+                        }
+                      });
+                      
+                      return (
+                        <>
+                          {currentPath !== "" && (
+                            <button 
+                              onClick={() => {
+                                const parts = currentPath.split('/');
+                                parts.pop();
+                                setCurrentPath(parts.join('/'));
+                              }}
+                              className="flex items-center gap-2 px-3 py-2 hover:bg-zinc-800 rounded-xl text-zinc-400 hover:text-white transition-all w-full text-sm mb-2 font-medium"
+                            >
+                              <Folder size={14} />
+                              ..
+                            </button>
+                          )}
+                          {displayFiles.length > 0 ? (
+                            displayFiles.map(file => {
+                              const isDirectory = file.endsWith('/');
+                              const displayName = isDirectory ? file.slice(0, -1) : file;
+                              const nameParts = displayName.split('/');
+                              const basename = nameParts[nameParts.length - 1];
+                              return (
+                              <div key={file} className="flex gap-1 group/file">
+                                <button
+                                  onClick={() => isDirectory ? setCurrentPath(displayName) : handleSetMainFile(file)}
+                                  className={cn(
+                                    "flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all group overflow-hidden",
+                                    selectedProject?.mainFile === file && !isDirectory
+                                      ? "bg-blue-600/10 text-blue-500 border border-blue-600/20" 
+                                      : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-transparent"
+                                  )}
+                                >
+                                  <div className="flex-shrink-0">
+                                    {isDirectory ? <Folder size={14} className="text-blue-400" /> : file.endsWith('.py') ? <Cpu size={14} /> : <FileCode size={14} />}
+                                  </div>
+                                  <span className="flex-1 text-left truncate font-medium">{basename}</span>
+                                  {selectedProject?.mainFile === file && !isDirectory && <CheckCircle2 size={14} className="text-blue-500 flex-shrink-0" />}
+                                </button>
+                                
+                                <div className="flex items-center gap-0.5 opacity-0 group-hover/file:opacity-100 transition-opacity">
+                                  {isDirectory && (
+                                    <>
+                                      <button 
+                                        onClick={() => setManageFileModal({ isOpen: true, action: "create", isDir: true, targetPath: displayName })}
+                                        className="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-all" title="New Folder inside"
+                                      >
+                                        <FolderPlus size={14} />
+                                      </button>
+                                      <button 
+                                        onClick={() => setManageFileModal({ isOpen: true, action: "create", isDir: false, targetPath: displayName })}
+                                        className="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-all" title="New File inside"
+                                      >
+                                        <FilePlus2 size={14} />
+                                      </button>
+                                    </>
+                                  )}
+                                  <button 
+                                    onClick={() => { setManageFileInput(""); setManageFileModal({ isOpen: true, action: "rename", isDir: isDirectory, targetPath: displayName }); }}
+                                    className="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-all" title="Rename"
+                                  >
+                                    <Edit2 size={14} />
+                                  </button>
+                                  <button 
+                                    onClick={() => { if(confirm(`Are you sure you want to delete ${displayName}?`)) { setManageFileModal({ isOpen: true, action: "delete", isDir: isDirectory, targetPath: displayName }); setTimeout(submitFileManage, 0); } }}
+                                    className="p-2 text-red-500/70 hover:text-red-400 hover:bg-zinc-800 rounded-lg transition-all" title="Delete"
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                  {!isDirectory && (
+                                    <button 
+                                      onClick={() => handleDownloadFile(selectedProjectId, file)}
+                                      className="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-all" title="Download File"
+                                    >
+                                      <Download size={14} />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              );
+                            })
+                          ) : (
+                            <div className="h-full flex flex-col items-center justify-center text-zinc-600 gap-3 p-8">
+                              {currentPath === "" ? (
+                                <>
+                                  <div className="w-12 h-12 bg-zinc-900 rounded-full flex items-center justify-center mb-2">
+                                    <AlertCircle size={24} strokeWidth={1.5} className="text-zinc-700" />
+                                  </div>
+                                  <p className="text-xs font-medium text-center leading-relaxed">No files found locally.</p>
+                                  <button 
+                                    onClick={() => handleSyncFiles(selectedProjectId!)}
+                                    className="text-[10px] font-bold uppercase tracking-widest text-blue-500 hover:text-blue-400 flex items-center gap-2 mt-2"
+                                  >
+                                    <CloudDownload size={14} />
+                                    <span>Restore from Cloud</span>
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <div className="w-12 h-12 bg-zinc-900 rounded-full flex items-center justify-center mb-2">
+                                    <Folder size={24} strokeWidth={1.5} className="text-zinc-700" />
+                                  </div>
+                                  <p className="text-xs font-medium text-center leading-relaxed">This folder is empty.</p>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -1781,6 +1928,80 @@ export default function App() {
                   className="flex-1 px-4 py-3 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:hover:bg-orange-600 rounded-xl font-bold text-sm transition-all shadow-lg shadow-orange-900/20"
                 >
                   Create Project
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Manage File Modal */}
+      <AnimatePresence>
+        {manageFileModal.isOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+              onClick={() => setManageFileModal(prev => ({ ...prev, isOpen: false }))}
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-zinc-950 border border-zinc-800 rounded-3xl overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/50">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-blue-600/20 text-blue-500 rounded-xl flex items-center justify-center">
+                    {manageFileModal.action === "rename" ? <Edit2 size={20} /> : manageFileModal.action === "delete" ? <Trash2 size={20} /> : manageFileModal.isDir ? <FolderPlus size={20} /> : <FilePlus2 size={20} />}
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold">
+                      {manageFileModal.action === 'rename' ? 'Rename' : manageFileModal.action === 'delete' ? 'Delete' : 'Create'} {manageFileModal.isDir && manageFileModal.action !== 'rename' ? 'Folder' : manageFileModal.action === 'rename' ? (manageFileModal.isDir ? 'Folder' : 'File') : 'File'}
+                    </h3>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setManageFileModal(prev => ({ ...prev, isOpen: false }))}
+                  className="p-2 hover:bg-zinc-800 rounded-xl transition-colors text-zinc-500 hover:text-white"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="p-6 space-y-4">
+                {manageFileModal.action === "delete" ? (
+                  <p className="text-zinc-400">Are you sure you want to delete {manageFileModal.targetPath}?</p>
+                ) : (
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-widest text-zinc-500 mb-2">
+                       {manageFileModal.action === 'rename' ? 'New Name' : 'Name'}
+                    </label>
+                    <input 
+                      type="text" 
+                      value={manageFileInput}
+                      onChange={e => setManageFileInput(e.target.value)}
+                      placeholder={manageFileModal.action === 'rename' ? "new-name.txt" : "name"}
+                      className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-blue-500 transition-colors placeholder:text-zinc-700"
+                      autoFocus
+                    />
+                  </div>
+                )}
+              </div>
+              <div className="p-6 bg-zinc-900/50 border-t border-zinc-800 flex gap-3">
+                <button 
+                  onClick={() => setManageFileModal(prev => ({ ...prev, isOpen: false }))}
+                  className="flex-1 px-4 py-3 bg-zinc-800 hover:bg-zinc-700 rounded-xl font-bold text-sm transition-all"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={submitFileManage}
+                  disabled={manageFileModal.action !== "delete" && !manageFileInput}
+                  className={`flex-1 px-4 py-3 rounded-xl font-bold text-sm transition-all disabled:opacity-50 ${manageFileModal.action === 'delete' ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-900/20'}`}
+                >
+                  {manageFileModal.action === 'rename' ? 'Rename' : manageFileModal.action === 'delete' ? 'Delete' : 'Create'}
                 </button>
               </div>
             </motion.div>
